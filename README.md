@@ -4,6 +4,58 @@
 
 An independent lab automation project for deploying **IBM Storage Fusion, IBM Fusion Data Foundation / Ceph, and an OpenShift-side IBM Storage Scale data-access client** on a disposable IBM TechZone OpenShift cluster. The lab is expected to provide an **already deployed external IBM Storage Scale server**; this project connects to that server rather than installing a second Scale server.
 
+## Getting started — transfer and install the package
+
+These are the **first two copy-and-paste steps** for the existing Windows + SecureCRT + Ubuntu Ansible-server workflow. First download `IBM-Fusion-Lab01-OneCommand-v2.1.zip` and save it in `D:\Dropbox\Fusion` on the Windows computer.
+
+### Step 1 — SecureCRT SFTP (Windows)
+
+Paste into a **SecureCRT SFTP session** (not the Ubuntu SSH shell):
+
+```text
+lcd D:\Dropbox\Fusion
+cd /home/automation
+put IBM-Fusion-Lab01-OneCommand-v2.1.zip
+```
+
+This uploads the ZIP to `/home/automation` on the existing Ubuntu automation server. Change the local path and Ubuntu username/home directory if your environment differs.
+
+### Step 2 — Ubuntu SSH (Ansible server)
+
+Paste into the **Ubuntu SSH session** (not the SFTP prompt):
+
+```bash
+mkdir -p ~/fusion-lab01-installer
+
+cd ~/fusion-lab01-installer
+
+unzip -o ~/IBM-Fusion-Lab01-OneCommand-v2.1.zip -d .
+
+ls -lah
+```
+
+The extracted project should contain `install-lab01.sh`, `installer/`, `reference/`, and `docs/`. **Extraction does not start the deployment or modify OpenShift.**
+
+> **For public GitHub users:** Once this repository is published, `git clone` is an alternative to SFTP and unzipping a release ZIP. The two steps above document the original SecureCRT workflow, not a mandatory Ansible directory layout.
+
+### Step 3 — Obtain and verify the fresh cluster kubeconfig
+
+Follow [00 — Prerequisites and kubeconfig](docs/00-PREREQUISITES.md). Keep the kubeconfig outside this repository, and verify `oc whoami`, `oc get nodes`, and the actual API endpoint before running the installer.
+
+### Step 4 — Wait for OpenShift to become fully healthy
+
+**Before running `plan` or `deploy`,** perform the copy/paste [fresh-cluster health check](docs/01-FRESH-LAB-RUNBOOK.md#step-2--fresh-openshift-health-gate-read-only). A new TechZone reservation may show all nine nodes `Ready` while OpenShift Operators are still reconciling. Wait until:
+
+- ClusterVersion: `AVAILABLE=True`, `PROGRESSING=False`.
+- Every ClusterOperator: `AVAILABLE=True`, `PROGRESSING=False`, `DEGRADED=False`.
+- MachineConfigPools: `UPDATED=True`, `UPDATING=False`, `DEGRADED=False` with all configured nodes updated and ready.
+
+An initially unavailable Console Operator or progressing Kubernetes API Server is a **wait-and-recheck condition**, not a reason to start Fusion installation early.
+
+### Step 5 — Plan first, then deploy
+
+Use the [fresh-cluster runbook](docs/01-FRESH-LAB-RUNBOOK.md) to run the read-only `plan`, confirm the blank Ceph disks and remote Scale endpoint, and then explicitly approve disk claims and worker reboots for `deploy`.
+
 ## How the installer is structured
 
 ```text
@@ -16,7 +68,7 @@ docs/                          # GitHub-facing procedures and validation evidenc
 
 The shell launcher calls the Python orchestrator. The orchestrator uses `oc` for OpenShift discovery and invokes Ansible playbooks and existing shell tests in order. `reference/` contains historical playbooks with previous lab identifiers; **do not execute them directly on a new cluster**.
 
-## Quick start
+## Installer commands (after Steps 1–3)
 
 First, obtain a fresh reservation and a dedicated kubeconfig. See [Prerequisites and access](docs/00-PREREQUISITES.md) before any deployment.
 

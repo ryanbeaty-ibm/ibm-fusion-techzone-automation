@@ -4,6 +4,8 @@ Use the **first failing stage**, not just the final application pod's status. Th
 
 | Symptom | Likely diagnosis / next step |
 |---|---|
+| New reservation shows all nine nodes Ready but ClusterVersion reports Console unavailable | Inspect `oc get co`, `oc get pods -n openshift-console`, `oc get mcp`, and `oc get clusterversion`. Wait for Console and other ClusterOperators to settle; do not start Fusion installation early. |
+| `kube-apiserver` remains Progressing | Run `oc wait co/kube-apiserver --for=condition=Progressing=False --timeout=10m`, then inspect all operators, MachineConfigPools, and ClusterVersion again. This wait is not a full-cluster health check. |
 | `oc` cannot authenticate or wrong cluster | Verify the explicit kubeconfig path, `oc whoami`, API endpoint, node prefix, and nine-node inventory. |
 | Fusion/ODF stage errors | Capture the first failing Ansible task and the associated operator/StorageCluster conditions. Do not delete a StorageCluster to retry. |
 | Scale MCP remains Updating | MachineConfig changes may reboot selected worker nodes. Check `oc get mcp` and node readiness; Ceph infra nodes are deliberately separate. |

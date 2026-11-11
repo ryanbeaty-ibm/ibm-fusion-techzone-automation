@@ -20,9 +20,9 @@ The final successful run was `bash scripts/lab01-scale-finish.sh finish` from v1
 - `docs/` and `.gitignore`: GitHub documentation and rules protecting runtime files from commits.
 - `work/<cluster-prefix>/`: generated automatically when running the command. The generated workspace is pinned to the actual kubeconfig/API and checked cluster. It is intentionally never overwritten if its settings change; this prevents accidental cross-cluster re-use.
 
-## Keep it in Dropbox, deploy from Ubuntu
+## Step 1 — SecureCRT SFTP (Windows)
 
-Copy the ZIP into `D:\Dropbox\Fusion` for backup, then use **SecureCRT SFTP**:
+Save `IBM-Fusion-Lab01-OneCommand-v2.1.zip` in `D:\Dropbox\Fusion` on your Windows computer. Paste these commands into **SecureCRT SFTP**:
 
 ```text
 lcd D:\Dropbox\Fusion
@@ -30,13 +30,27 @@ cd /home/automation
 put IBM-Fusion-Lab01-OneCommand-v2.1.zip
 ```
 
-On your existing Ubuntu automation server:
+## Step 2 — Ubuntu SSH (Ansible server)
+
+Paste this into **Ubuntu SSH**, not the SFTP prompt:
 
 ```bash
 mkdir -p ~/fusion-lab01-installer
+
 cd ~/fusion-lab01-installer
+
 unzip -o ~/IBM-Fusion-Lab01-OneCommand-v2.1.zip -d .
+
+ls -lah
 ```
+
+This prepares the installer only. Do **not** execute `deploy` until the new cluster's kubeconfig, disk selection, and Scale management IP have been verified.
+
+## Step 3 — Kubeconfig, prerequisites and cluster health
+
+Download the new TechZone kubeconfig to the Ubuntu server, keep it **outside** this project, and follow [docs/00-PREREQUISITES.md](docs/00-PREREQUISITES.md) for verification. **Run the read-only [OpenShift health gate](docs/01-FRESH-LAB-RUNBOOK.md#step-2--fresh-openshift-health-gate-read-only) before starting `plan` or `deploy`**. Nine Ready nodes alone do not mean a brand-new cluster has finished initializing.
+
+The target state is all ClusterOperators Available, not Progressing, not Degraded; master/worker MachineConfigPools Updated; and ClusterVersion Available without Progressing. This check was added after the clean TechZone reservation initially reported a transient Console Operator issue and a progressing Kubernetes API Server.
 
 ### One deployment command for the NEXT clean TechZone lab
 
