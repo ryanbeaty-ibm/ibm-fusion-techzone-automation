@@ -1,0 +1,61 @@
+---
+# Consolidated entry point 3/3. Default read-only Operator health.
+# verify_stage=full checks Operators, Fusion, Data Foundation, and Ceph.
+# verify_stage=persistence ALSO CREATES/DELETES a temporary namespace, PVC and pods;
+# it requires independent explicit authorization and target binding.
+- name: 'Verification dispatcher | Target safety and isolated storage test gate'
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    verify_stage: operator
+    kubeconfig_path: ''
+    expected_api_server: ''
+    protected_api_server: ''
+  tasks:
+    - name: 'Require explicit alternate kubeconfig and correctly scoped verification'
+      ansible.builtin.assert:
+        that:
+          - verify_stage in ['operator', 'fusion', 'data-foundation', 'full', 'persistence']
+          - kubeconfig_path | length > 0
+          - kubeconfig_path != (lookup('env', 'HOME') ~ '/.kube/config')
+          - expected_api_server is match('^https://[^/]+:6443$')
+          - protected_api_server == '' or expected_api_server != protected_api_server
+          - not (operator_phase_apply | default(false) | bool)
+          - not (approve_fusion_installplan | default(false) | bool)
+          - not (initialize_fusion | default(false) | bool)
+          - not (install_data_foundation | default(false) | bool)
+          - not (approve_disk_claim | default(false) | bool)
+          - (persistence_test_approved | default(false) | bool) == (verify_stage == 'persistence')
+          - verify_stage != 'persistence' or protected_api_server | length > 0
+          - verify_stage != 'persistence' or persistence_approval_phrase | default('') == 'I_APPROVE_TEMPORARY_PVC_TEST'
+        fail_msg: 'BLOCKED - Invalid target, writes, or PVC test approval.'
+
+    - name: 'Confirm connected API before any verification'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami, --show-server]
+      register: verify_api
+      changed_when: false
+
+    - name: 'Require exact target cluster'
+      ansible.builtin.assert:
+        that:
+          - (verify_api.stdout | trim) == (expected_api_server | trim)
+          - protected_api_server == '' or (verify_api.stdout | trim) != (protected_api_server | trim)
+        fail_msg: 'BLOCKED - Verify kubeconfig does not match expected API server.'
+
+- import_playbook: internal/verify-fusion-operator-stage4o.yml
+  when: (verify_stage | default('operator')) in ['operator', 'fusion', 'data-foundation', 'full', 'persistence']
+
+- import_playbook: internal/inspect-spectrumfusion-stage4p.yml
+  when: (verify_stage | default('operator')) in ['fusion', 'data-foundation', 'full', 'persistence']
+
+- import_playbook: internal/inspect-data-foundation-stage4r.yml
+  when: (verify_stage | default('operator')) in ['data-foundation', 'full', 'persistence']
+
+- import_playbook: internal/verify-fusion-pinned.yml
+  when: (verify_stage | default('operator')) in ['full', 'persistence']
+
+- import_playbook: internal/verify-storage-guarded.yml
+  when: (verify_stage | default('operator')) == 'persistence'

@@ -1,0 +1,55 @@
+---
+- name: IBM Fusion Scale v1.1 | Render isolated Scale node preparation (NO APPLY)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    manifest_dir: '{{ playbook_dir }}/../build/scale-v1.1'
+    expected_scale_nodes:
+      - itz-d4xrcs-worker-1
+      - itz-d4xrcs-worker-2
+      - itz-d4xrcs-worker-3
+  tasks:
+    - name: Guard Lab 2 only and prevent applying live cluster changes
+      ansible.builtin.assert:
+        that:
+          - kubeconfig == '/home/automation/.kube/techzone-2.conf'
+          - not (scale_apply_enabled | bool)
+          - (scale_nodes | sort) == (expected_scale_nodes | sort)
+        fail_msg: 'Node-prep render is Lab #2 only, three selected workers only, NO APPLY.'
+
+    - name: Create protected local manifest directory
+      ansible.builtin.file:
+        path: '{{ manifest_dir }}'
+        state: directory
+        mode: '0700'
+
+    - name: Render custom MachineConfigPool and Scale-only kernel-devel MachineConfig
+      ansible.builtin.template:
+        src: '{{ playbook_dir }}/../templates/{{ item }}.j2'
+        dest: '{{ manifest_dir }}/{{ item }}'
+        mode: '0600'
+      loop:
+        - 00-scale-mcp.yaml
+        - 00-scale-kernel-devel.yaml
+
+    - name: Server-validate both manifests without creating resources
+      ansible.builtin.command:
+        argv:
+          - oc
+          - '--kubeconfig={{ kubeconfig }}'
+          - apply
+          - '--dry-run=server'
+          - '--validate=strict'
+          - -f
+          - '{{ manifest_dir }}/00-scale-mcp.yaml'
+          - -f
+          - '{{ manifest_dir }}/00-scale-kernel-devel.yaml'
+      register: validation_result
+      changed_when: false
+
+    - name: Show validation output
+      ansible.builtin.debug:
+        msg:
+          - '{{ validation_result.stdout_lines }}'
+          - 'NO CLUSTER CHANGES. A future deployment phase will label ONLY the three Scale workers, create the Scale pool, and then install kernel-devel.'

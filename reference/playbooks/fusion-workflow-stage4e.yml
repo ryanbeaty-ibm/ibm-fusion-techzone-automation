@@ -1,0 +1,149 @@
+---
+# IBM Storage Fusion 2.14.x / OpenShift 4.21 - Phase 4E
+# Integrated SAFE AUDIT workflow. This file NEVER performs an installation.
+# Reuses proven Stage 4A-D playbooks; does not replace them.
+# Read-only by default. Explicit opt-in (workflow_verify=true) adds
+# verify-fusion.yml, which is read-only. verify-storage.yml is NOT called,
+# since it creates/deletes a temporary test namespace and PVC.
+#
+# IMPORTANT: This is an audit controller, NOT a completed fresh installer.
+# Future deployment phases must add separate approvals and installation paths.
+
+- name: "Phase 4E | Check safety and discover which audit stages can run"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    workflow_verify: false
+
+  tasks:
+    - name: "00 | Refuse write-capable or plan-generation options"
+      ansible.builtin.assert:
+        that:
+          - not (install_operators | default(false) | bool)
+          - not (initialize_fusion | default(false) | bool)
+          - not (accept_ibm_license | default(false) | bool)
+          - not (generate_manifest | default(false) | bool)
+          - not (run_persistence_test | default(false) | bool)
+        success_msg: "PASS - Phase 4E is audit-only; write-capable switches are disabled"
+        fail_msg: >-
+          STOP - Phase 4E must remain read-only. Do not supply installation,
+          license-acceptance, disk-plan generation, or persistence-test flags.
+          Run a reviewed stage directly when that operation is required.
+
+    - name: "00 | Show active OpenShift context"
+      ansible.builtin.command:
+        argv: [oc, config, current-context]
+      register: phase4e_context
+      changed_when: false
+
+    - name: "00 | Confirm OpenShift identity"
+      ansible.builtin.command:
+        argv: [oc, whoami]
+      register: phase4e_identity
+      changed_when: false
+
+    - name: "00 | Inventory available OpenShift CRDs"
+      ansible.builtin.command:
+        argv: [oc, get, crds, -o, json]
+      register: phase4e_crds_cmd
+      changed_when: false
+
+    - name: "00 | Evaluate API availability"
+      ansible.builtin.set_fact:
+        phase4e_crd_names: >-
+          {{ ((phase4e_crds_cmd.stdout | from_json)['items']) |
+             map(attribute='metadata.name') | list }}
+
+    - name: "00 | Check if local-disk discovery has been installed"
+      ansible.builtin.set_fact:
+        phase4e_has_discovery_api: >-
+          {{ (phase4e_crd_names | select('match', '^localvolumediscoveryresults[.]')
+              | list | length) > 0 }}
+        phase4e_has_service_api: >-
+          {{ (phase4e_crd_names | select('match', '^fusionservicedefinitions[.]')
+              | list | length) > 0 }}
+
+    - name: "00 | Count device discovery results if the API exists"
+      ansible.builtin.command:
+        argv: [oc, get, localvolumediscoveryresults, -A, -o, json]
+      register: phase4e_discovery_cmd
+      changed_when: false
+      when: phase4e_has_discovery_api | bool
+
+    - name: "00 | Look up the Data Foundation service definition"
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - fusionservicedefinition
+          - data-foundation-service
+          - -n
+          - ibm-spectrum-fusion-ns
+          - -o
+          - name
+          - --ignore-not-found
+      register: phase4e_service_definition_cmd
+      changed_when: false
+      when: phase4e_has_service_api | bool
+
+    - name: "00 | Record which optional audit stages are ready"
+      ansible.builtin.set_fact:
+        phase4e_has_discovery_data: >-
+          {{ (phase4e_has_discovery_api | bool) and
+             ((phase4e_discovery_cmd.stdout | default('{"items":[]}') | from_json)['items']
+              | length > 0) }}
+        phase4e_has_service_definition: >-
+          {{ (phase4e_has_service_api | bool) and
+             (phase4e_service_definition_cmd.stdout | default('') | trim | length > 0) }}
+
+    - name: "00 | Show safe execution plan"
+      ansible.builtin.debug:
+        msg:
+          - "OpenShift context: {{ phase4e_context.stdout }} ({{ phase4e_identity.stdout }})"
+          - "Stage 4A - Fusion / OLM / Ceph inventory: RUN"
+          - "Stage 4B - Disk filtering: {{ 'RUN' if phase4e_has_discovery_data else 'SKIP (no discovery data)' }}"
+          - "Stage 4C - LocalVolumeSet planning audit: {{ 'RUN' if phase4e_has_discovery_data else 'SKIP (no discovery data)' }}"
+          - "Stage 4D - Data Foundation service audit: {{ 'RUN' if phase4e_has_service_definition else 'SKIP (service definition absent)' }}"
+          - "Fusion functional verification: {{ 'RUN' if workflow_verify | bool else 'SKIP (opt-in)' }}"
+          - "No installation, LocalVolumeSet, or disk claim will be applied."
+
+# IMPORTANT: Explicit vars force non-writing defaults for imported stages.
+# Ansible extra-vars override play vars, hence the initial guard refuses them.
+- import_playbook: install-fusion.yml
+  vars:
+    install_operators: false
+    initialize_fusion: false
+    accept_ibm_license: false
+
+- import_playbook: discover-ceph-disks.yml
+  vars:
+    generate_manifest: false
+  when: phase4e_has_discovery_data | default(false) | bool
+
+- import_playbook: plan-localvolumeset.yml
+  vars:
+    generate_manifest: false
+  when: phase4e_has_discovery_data | default(false) | bool
+
+- import_playbook: plan-data-foundation-stage4d.yml
+  vars:
+    generate_manifest: false
+  when: phase4e_has_service_definition | default(false) | bool
+
+# Optional read-only Fusion health verification (no test PVC is created).
+- import_playbook: verify-fusion.yml
+  when: workflow_verify | default(false) | bool
+
+- name: "Phase 4E | Integrated audit completed"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: "99 | Summary"
+      ansible.builtin.debug:
+        msg: >-
+          PASS - Phase 4E integrated audit completed. No deployment was requested;
+          no disks were claimed. Missing components or untested fresh-install
+          sequencing still require additional development and acceptance testing.

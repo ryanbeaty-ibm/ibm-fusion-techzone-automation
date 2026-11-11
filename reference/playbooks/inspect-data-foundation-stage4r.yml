@@ -1,0 +1,261 @@
+---
+# Phase 4R - IBM Fusion Data Foundation prerequisite/state audit.
+# READ ONLY. Does not accept licenses, apply service resources, claim disks,
+# create StorageClusters, or approve InstallPlans.
+# Target IBM Fusion 2.14.1 / tested POC OpenShift 4.21.24.
+- name: 'Phase 4R | Inspect Data Foundation readiness and existing service state'
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    scenario: live
+    kubeconfig_path: "{{ lookup('env', 'HOME') }}/.kube/config"
+    expected_api_server: ''
+    fusion_namespace: ibm-spectrum-fusion-ns
+    fusion_cr_name: spectrumfusion
+    service_definition_name: data-foundation-service
+    service_instance_name: odfmanager
+    expected_fusion_csv: isf-operator.v2.14.1
+    spectrumfusion_crd: spectrumfusions.prereq.isf.ibm.com
+    service_instance_crd: fusionserviceinstances.service.isf.ibm.com
+    storagecluster_crd: storageclusters.ocs.openshift.io
+  tasks:
+    - name: '00 | Prohibit deployment switches'
+      ansible.builtin.assert:
+        that:
+          - scenario in ['live', 'empty', 'fusion_initialized', 'service_installed']
+          - not (deploy | default(false) | bool)
+          - not (apply | default(false) | bool)
+          - not (operator_phase_apply | default(false) | bool)
+          - not (approve_fusion_installplan | default(false) | bool)
+          - not (initialize_fusion | default(false) | bool)
+          - not (accept_ibm_license | default(false) | bool)
+          - not (install_data_foundation | default(false) | bool)
+          - not (generate_manifest | default(false) | bool)
+          - not (approve_disk_claim | default(false) | bool)
+        fail_msg: 'BLOCKED - Phase 4R is a read-only inspection; remove deployment options.'
+        success_msg: 'PASS - Data Foundation inspection is read-only'
+
+    - name: '01 | Simulate state without any OpenShift calls'
+      ansible.builtin.debug:
+        msg:
+          - 'OFFLINE SIMULATION - scenario={{ scenario }}'
+          - >-
+              {{ 'Expected state: Operator/SpectrumFusion not yet initialized; do not attempt Data Foundation installation'
+                 if scenario == 'empty' else
+                 'Expected state: inspect service definition and verify prerequisites before separately authorizing service creation'
+                 if scenario == 'fusion_initialized' else
+                 'Expected state: recognize existing odfmanager and Ceph storage; never reinstall over existing resources' }}
+          - 'No OpenShift calls, no service creation, no disk modifications'
+      when: scenario != 'live'
+
+    - name: '02 | Inspect live OpenShift installation state'
+      when: scenario == 'live'
+      block:
+        - name: '02 | Check kubeconfig exists'
+          ansible.builtin.stat:
+            path: '{{ kubeconfig_path }}'
+          register: r_kube
+
+        - name: '02 | Require regular kubeconfig file'
+          ansible.builtin.assert:
+            that:
+              - r_kube.stat.isreg | default(false)
+            fail_msg: 'BLOCKED - Missing kubeconfig: {{ kubeconfig_path }}'
+
+        - name: '02 | Resolve cluster API'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami, --show-server]
+          register: r_api
+          changed_when: false
+
+        - name: '02 | Resolve authenticated identity'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami]
+          register: r_user
+          changed_when: false
+
+        - name: '02 | Require pinned target when using another kubeconfig'
+          ansible.builtin.assert:
+            that:
+              - >-
+                (expected_api_server | length > 0) or
+                kubeconfig_path == (lookup('env', 'HOME') ~ '/.kube/config')
+              - >-
+                (expected_api_server | length == 0) or
+                (r_api.stdout | trim) == (expected_api_server | trim)
+            fail_msg: 'BLOCKED - Non-default kubeconfig requires a matching expected_api_server.'
+            success_msg: 'PASS - OpenShift API target binding checked'
+
+        - name: '03 | Read installed Operator CSVs'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, csv, -A, -o, json]
+          register: r_csv_raw
+          changed_when: false
+
+        - name: '03 | Check SpectrumFusion CRD availability'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, crd, '{{ spectrumfusion_crd }}', -o, json, --ignore-not-found]
+          register: r_fusion_crd_raw
+          changed_when: false
+
+        - name: '03 | Check Data Foundation service instance CRD availability'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, crd, '{{ service_instance_crd }}', -o, json, --ignore-not-found]
+          register: r_service_crd_raw
+          changed_when: false
+
+        - name: '03 | Check Ceph StorageCluster CRD availability'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, crd, '{{ storagecluster_crd }}', -o, json, --ignore-not-found]
+          register: r_storage_crd_raw
+          changed_when: false
+
+        - name: '03 | Calculate installed APIs and Operator success'
+          ansible.builtin.set_fact:
+            r_fusion_crd_exists: '{{ r_fusion_crd_raw.stdout | trim | length > 0 }}'
+            r_service_crd_exists: '{{ r_service_crd_raw.stdout | trim | length > 0 }}'
+            r_storage_crd_exists: '{{ r_storage_crd_raw.stdout | trim | length > 0 }}'
+            r_operator_matches: >-
+              {{ (r_csv_raw.stdout | from_json)['items'] |
+                 selectattr('metadata.namespace', 'equalto', fusion_namespace) |
+                 selectattr('metadata.name', 'equalto', expected_fusion_csv) | list }}
+
+        - name: '03 | Refuse ambiguous Operator CSV results'
+          ansible.builtin.assert:
+            that:
+              - r_operator_matches | length <= 1
+            fail_msg: 'BLOCKED - Duplicate expected Fusion Operator CSVs detected.'
+
+        - name: '04 | Read SpectrumFusion CRs where supported'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, '{{ spectrumfusion_crd }}', -A, -o, json]
+          register: r_fusion_raw
+          changed_when: false
+          when: r_fusion_crd_exists | bool
+
+        - name: '04 | Read Data Foundation service definition if Fusion Operator exists'
+          ansible.builtin.command:
+            argv:
+              - oc
+              - '--kubeconfig={{ kubeconfig_path }}'
+              - get
+              - fusionservicedefinition
+              - '{{ service_definition_name }}'
+              - -n
+              - '{{ fusion_namespace }}'
+              - -o
+              - json
+              - --ignore-not-found
+          register: r_definition_raw
+          changed_when: false
+          failed_when: false
+          when: r_operator_matches | length == 1
+
+        - name: '04 | Read existing FusionServiceInstances when API exists'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, '{{ service_instance_crd }}', -A, -o, json]
+          register: r_services_raw
+          changed_when: false
+          when: r_service_crd_exists | bool
+
+        - name: '04 | Read existing StorageClusters when API exists'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, '{{ storagecluster_crd }}', -A, -o, json]
+          register: r_storages_raw
+          changed_when: false
+          when: r_storage_crd_exists | bool
+
+        - name: '05 | Normalize existing resource inventories'
+          ansible.builtin.set_fact:
+            r_fusions: >-
+              {{ (r_fusion_raw.stdout | from_json)['items'] if r_fusion_crd_exists | bool else [] }}
+            r_services: >-
+              {{ (r_services_raw.stdout | from_json)['items'] if r_service_crd_exists | bool else [] }}
+            r_storages: >-
+              {{ (r_storages_raw.stdout | from_json)['items'] if r_storage_crd_exists | bool else [] }}
+            r_definition_exists: >-
+              {{ (r_definition_raw.rc | default(1) == 0) and
+                 (r_definition_raw.stdout | default('') | trim | length > 0) }}
+            r_definition_query_error: >-
+              {{ (r_definition_raw.rc | default(0)) != 0 }}
+            r_operator_ready: >-
+              {{ r_operator_matches | length == 1 and
+                 (r_operator_matches[0].status.phase | default('')) == 'Succeeded' }}
+
+        - name: '05 | Select expected Fusion and Data Foundation objects'
+          ansible.builtin.set_fact:
+            r_target_fusions: >-
+              {{ r_fusions | selectattr('metadata.namespace', 'equalto', fusion_namespace) |
+                 selectattr('metadata.name', 'equalto', fusion_cr_name) | list }}
+            r_target_services: >-
+              {{ r_services | selectattr('metadata.namespace', 'equalto', fusion_namespace) |
+                 selectattr('metadata.name', 'equalto', service_instance_name) | list }}
+            r_target_storages: >-
+              {{ r_storages | selectattr('metadata.namespace', 'equalto', 'openshift-storage') |
+                 selectattr('metadata.name', 'equalto', 'ocs-storagecluster') | list }}
+
+        - name: '05 | Require no duplicate or foreign install resources'
+          ansible.builtin.assert:
+            that:
+              - r_fusions | length <= 1
+              - r_services | length <= 1
+              - r_storages | length <= 1
+              - r_fusions | length == r_target_fusions | length
+              - r_services | length == r_target_services | length
+              - r_storages | length == r_target_storages | length
+            fail_msg: >-
+              BLOCKED - Unexpected Fusion, Data Foundation service or StorageCluster
+              objects. Inspect manually; do not install a second instance.
+
+        - name: '05 | Determine Fusion and Data Foundation configuration'
+          ansible.builtin.set_fact:
+            r_license_accepted: >-
+              {{ (r_target_fusions[0].spec.license.accept | default(false) | bool)
+                 if r_target_fusions | length == 1 else false }}
+            r_gdp_enabled: >-
+              {{ (r_target_fusions[0].spec.GlobalDataPlatform.Enable | default(false) | bool)
+                 if r_target_fusions | length == 1 else false }}
+            r_service_health: >-
+              {{ r_target_services[0].status.health | default('not reported')
+                 if r_target_services | length == 1 else 'n/a' }}
+            r_install_status: >-
+              {{ r_target_services[0].status.installStatus.status | default('not reported')
+                 if r_target_services | length == 1 else 'n/a' }}
+            r_storage_phase: >-
+              {{ r_target_storages[0].status.phase | default('not reported')
+                 if r_target_storages | length == 1 else 'n/a' }}
+
+        - name: '06 | Classify service installation state'
+          ansible.builtin.set_fact:
+            r_state: >-
+              {{ 'ALREADY_INSTALLED' if
+                   (r_target_services | length == 1 and r_target_storages | length == 1 and
+                    r_service_health == 'Healthy' and r_install_status == 'Completed' and
+                    r_storage_phase == 'Ready') else
+                 'PARTIAL_INSTALL_REVIEW' if (r_services | length > 0 or r_storages | length > 0) else
+                 'OPERATOR_NOT_READY' if not r_operator_ready | bool else
+                 'SPECTRUMFUSION_NOT_INITIALIZED' if r_target_fusions | length == 0 else
+                 'FUSION_CONFIGURATION_REVIEW' if (not r_license_accepted | bool or r_gdp_enabled | bool) else
+                 'SERVICE_DEFINITION_NOT_READY' if not r_definition_exists | bool else
+                 'SERVICE_INSTANCE_API_NOT_READY' if not r_service_crd_exists | bool else
+                 'READY_FOR_SEPARATE_SERVICE_REVIEW' }}
+
+        - name: '06 | Show concise read-only Data Foundation assessment'
+          ansible.builtin.debug:
+            msg:
+              - 'Mode=READ ONLY; API={{ r_api.stdout | trim }}; login={{ r_user.stdout | trim }}'
+              - 'Kubeconfig={{ kubeconfig_path }}; API pin={{ expected_api_server | length > 0 }}'
+              - 'Fusion Operator {{ expected_fusion_csv }} Succeeded={{ r_operator_ready | bool }}'
+              - 'SpectrumFusion objects={{ r_fusions | length }}; license.accept={{ r_license_accepted | bool }}; GDP enabled={{ r_gdp_enabled | bool }}'
+              - 'Data Foundation service definition exists={{ r_definition_exists | bool }}; definition lookup error={{ r_definition_query_error | bool }}'
+              - 'FusionServiceInstance API={{ r_service_crd_exists | bool }}; instances={{ r_services | length }}'
+              - 'Service health={{ r_service_health }}; installation={{ r_install_status }}'
+              - 'StorageCluster API={{ r_storage_crd_exists | bool }}; clusters={{ r_storages | length }}; phase={{ r_storage_phase }}'
+              - 'STATE={{ r_state }}'
+              - 'No install authorized. Registry entitlement, capacity, and disk eligibility still require independent verification.'
+
+    - name: '99 | Finish read-only assessment'
+      ansible.builtin.debug:
+        msg: 'PASS - Phase 4R inspection/simulation finished with no cluster changes.'

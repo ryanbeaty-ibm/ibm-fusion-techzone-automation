@@ -1,0 +1,10 @@
+---
+# COPY to config/local/odf-lab-2.yml and adjust explicit nodes and disk path for each LAB.
+# This is disk inspection only. No formatting, labeling or ODF installation.
+odf_storage_nodes:
+  - itz-d4xrcs-infra-1
+  - itz-d4xrcs-infra-2
+  - itz-d4xrcs-infra-3
+odf_candidate_device: /dev/vde
+odf_min_disk_bytes: 400000000000
+odf_require_nonrotational: true

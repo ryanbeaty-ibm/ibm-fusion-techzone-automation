@@ -1,0 +1,38 @@
+# Generated installer workspace and logs
+work/
+logs/
+build/
+captured/
+*.log
+*.tar.gz
+*.zip
+
+# Local cluster credentials and private variables
+.kube/
+*.kubeconfig
+*kubeconfig*
+config/local/
+**/config/local/
+*.key
+*.pem
+*.p12
+*.pfx
+*-secret.yml
+*-secret.yaml
+*secrets*.yml
+*secrets*.yaml
+.env
+.env.*
+
+# Python, editor and OS local files
+__pycache__/
+*.py[cod]
+.venv/
+.vscode/
+.idea/
+.DS_Store
+
+# Ansible Vault (credentials and key must never be committed)
+*.vault.yml
+*.vault.yaml
+*.vault-password

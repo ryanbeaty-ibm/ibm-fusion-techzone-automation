@@ -1,0 +1,15 @@
+# Derived from IBM's official 6.0.1.x MachineConfig, with role changed from worker to scale.
+# Source: https://raw.githubusercontent.com/IBM/ibm-spectrum-scale-container-native/v6.0.1.x/generated/scale/mco/mco.yaml
+# DRAFT: This is intentionally NOT applied during rendering.
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 00-scale-ibm-spectrum-scale-kernel-devel
+  labels:
+    machineconfiguration.openshift.io/role: scale
+spec:
+  config:
+    ignition:
+      version: 3.2.0
+  extensions:
+    - kernel-devel

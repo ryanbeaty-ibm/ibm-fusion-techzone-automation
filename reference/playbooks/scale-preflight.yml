@@ -1,0 +1,78 @@
+---
+- name: IBM Fusion Scale v1.1 | Read-only Lab #2 preflight
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Require the Lab #2 kubeconfig and three target workers
+      ansible.builtin.assert:
+        that:
+          - kubeconfig == '/home/automation/.kube/techzone-2.conf'
+          - scale_nodes | length == 3
+          - scale_cluster_id | string == '12420798289407611590'
+          - not (scale_apply_enabled | bool)
+        fail_msg: 'This starter is a read-only Lab #2 review bundle, not an installer.'
+
+    - name: Inspect OpenShift nodes
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', get, nodes, -o, json]
+      register: nodes_cmd
+      changed_when: false
+
+    - name: Parse OpenShift nodes
+      ansible.builtin.set_fact:
+        nodes_obj: "{{ nodes_cmd.stdout | from_json }}"
+
+    - name: Confirm each target exists, has worker role, and is Ready
+      ansible.builtin.assert:
+        that:
+          - item in (nodes_obj['items'] | map(attribute='metadata.name') | list)
+          - "'node-role.kubernetes.io/worker' in (nodes_obj['items'] | selectattr('metadata.name', 'equalto', item) | first).metadata.labels"
+          - "(nodes_obj['items'] | selectattr('metadata.name', 'equalto', item) | first).status.conditions | selectattr('type','equalto','Ready') | map(attribute='status') | first == 'True'"
+        fail_msg: 'One or more proposed Scale worker nodes is unavailable.'
+      loop: '{{ scale_nodes }}'
+
+    - name: Inspect MachineConfig pools
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', get, mcp, -o, json]
+      register: mcp_cmd
+      changed_when: false
+
+    - name: Inspect Scale custom resources
+      ansible.builtin.command:
+        argv:
+          - oc
+          - '--kubeconfig={{ kubeconfig }}'
+          - get
+          - 'clusters.scale.spectrum.ibm.com,remoteclusters.scale.spectrum.ibm.com,filesystems.scale.spectrum.ibm.com'
+          - -n
+          - '{{ scale_namespace }}'
+          - -o
+          - json
+      register: existing_scale_cmd
+      changed_when: false
+
+    - name: Inspect Data Foundation storage (do not modify)
+      ansible.builtin.command:
+        argv:
+          - oc
+          - '--kubeconfig={{ kubeconfig }}'
+          - get
+          - 'storageclusters.ocs.openshift.io'
+          - -n
+          - openshift-storage
+          - -o
+          - json
+      register: ceph_cmd
+      changed_when: false
+
+    - name: Summarize preflight
+      ansible.builtin.debug:
+        msg:
+          - 'Lab #2: {{ kubeconfig }}'
+          - 'Scale workers selected: {{ scale_nodes | join(", ") }}'
+          - 'Worker MCP updated: {{ ((mcp_cmd.stdout | from_json)["items"] | selectattr("metadata.name", "equalto", "worker") | first).status.conditions | selectattr("type", "equalto", "Updated") | map(attribute="status") | first }}'
+          - 'Worker MCP degraded: {{ ((mcp_cmd.stdout | from_json)["items"] | selectattr("metadata.name", "equalto", "worker") | first).status.conditions | selectattr("type", "equalto", "Degraded") | map(attribute="status") | first }}'
+          - 'Existing Scale resources: {{ (existing_scale_cmd.stdout | from_json)["items"] | length }}'
+          - 'Existing Ceph StorageClusters: {{ (ceph_cmd.stdout | from_json)["items"] | length }}'
+          - 'NO CHANGES MADE. This playbook only reads OpenShift objects.'

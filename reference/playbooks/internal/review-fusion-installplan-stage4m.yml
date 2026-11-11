@@ -1,0 +1,210 @@
+---
+- name: Phase 4M | IBM Fusion InstallPlan review (never approve)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    kubeconfig_path: "{{ lookup('env', 'HOME') }}/.kube/config"
+    expected_api_server: ""
+    fusion_namespace: ibm-spectrum-fusion-ns
+    fusion_package: isf-operator
+    expected_fusion_csv: isf-operator.v2.14.1
+    scenario: live
+  tasks:
+    - name: "00 | Refuse all known write-capable flags"
+      ansible.builtin.assert:
+        that:
+          - scenario in ['live', 'empty']
+          - not (operator_phase_apply | default(false) | bool)
+          - not (approve_installplan | default(false) | bool)
+          - not (deploy | default(false) | bool)
+          - not (force_install | default(false) | bool)
+          - not (allow_disk_claim | default(false) | bool)
+          - not (generate_manifest | default(false) | bool)
+        success_msg: "PASS - InstallPlan review is read-only; no approvals or changes possible"
+        fail_msg: "REFUSED - Stage 4M is strictly read-only"
+
+    - name: "01 | Review the expected fresh-cluster workflow without OpenShift calls"
+      ansible.builtin.debug:
+        msg:
+          - "SIMULATION - Empty cluster"
+          - "First create OperatorGroup and Subscription using the controlled Phase 4L installer"
+          - "Wait for OLM to create a Manual InstallPlan"
+          - "Review the target CSV and plan contents before separately approving it"
+          - "No OpenShift calls; no modifications"
+      when: scenario == 'empty'
+
+    - name: "02 | Audit real cluster install plan"
+      when: scenario == 'live'
+      block:
+        - name: "02 | Confirm kubeconfig file exists"
+          ansible.builtin.stat:
+            path: "{{ kubeconfig_path }}"
+          register: kubeconfig_file
+
+        - name: "02 | Require kubeconfig and regular file"
+          ansible.builtin.assert:
+            that:
+              - kubeconfig_file.stat.exists
+              - kubeconfig_file.stat.isreg
+            fail_msg: "Missing kubeconfig file: {{ kubeconfig_path }}"
+
+        - name: "02 | Discover current API server"
+          ansible.builtin.command:
+            argv: [oc, --kubeconfig, "{{ kubeconfig_path }}", whoami, --show-server]
+          register: api_server
+          changed_when: false
+
+        - name: "02 | Discover current identity"
+          ansible.builtin.command:
+            argv: [oc, --kubeconfig, "{{ kubeconfig_path }}", whoami]
+          register: identity
+          changed_when: false
+
+        - name: "02 | Verify any supplied cluster pin"
+          ansible.builtin.assert:
+            that:
+              - (expected_api_server | length == 0) or (api_server.stdout | trim == expected_api_server)
+            success_msg: "PASS - Cluster identity checked (expected API pin supplied={{ expected_api_server | length > 0 }})"
+            fail_msg: "REFUSED - OpenShift server differs from expected_api_server"
+
+        - name: "03 | Read Subscriptions"
+          ansible.builtin.command:
+            argv: [oc, --kubeconfig, "{{ kubeconfig_path }}", get, subscriptions, -A, -o, json]
+          register: subscriptions_raw
+          changed_when: false
+
+        - name: "03 | Read InstallPlans"
+          ansible.builtin.command:
+            argv: [oc, --kubeconfig, "{{ kubeconfig_path }}", get, installplans, -A, -o, json]
+          register: installplans_raw
+          changed_when: false
+
+        - name: "03 | Read installed CSVs"
+          ansible.builtin.command:
+            argv: [oc, --kubeconfig, "{{ kubeconfig_path }}", get, csv, -A, -o, json]
+          register: csvs_raw
+          changed_when: false
+
+        - name: "04 | Select only the IBM Fusion Operator resources"
+          ansible.builtin.set_fact:
+            fusion_subscriptions: >-
+              {{ (subscriptions_raw.stdout | from_json)['items']
+                 | selectattr('metadata.namespace', 'equalto', fusion_namespace)
+                 | selectattr('spec.name', 'equalto', fusion_package) | list }}
+            fusion_namespace_plans: >-
+              {{ (installplans_raw.stdout | from_json)['items']
+                 | selectattr('metadata.namespace', 'equalto', fusion_namespace) | list }}
+            fusion_successful_csvs: >-
+              {{ (csvs_raw.stdout | from_json)['items']
+                 | selectattr('metadata.namespace', 'equalto', fusion_namespace)
+                 | selectattr('metadata.name', 'equalto', expected_fusion_csv)
+                 | selectattr('status.phase', 'equalto', 'Succeeded') | list }}
+
+        - name: "04 | Initialize Fusion InstallPlan ownership audit"
+          ansible.builtin.set_fact:
+            fusion_owned_plans: []
+
+        - name: "04 | Identify Fusion InstallPlans by original Subscription owner reference"
+          ansible.builtin.set_fact:
+            fusion_owned_plans: "{{ fusion_owned_plans + [item] }}"
+          loop: "{{ fusion_namespace_plans }}"
+          loop_control:
+            label: "{{ item.metadata.name }}"
+          when:
+            - expected_fusion_csv in (item.spec.clusterServiceVersionNames | default([]))
+            - >-
+              (item.metadata.ownerReferences | default([]) |
+               selectattr('kind', 'equalto', 'Subscription') |
+               selectattr('name', 'equalto', fusion_package) | list | length) > 0
+
+        - name: "04 | Identify orphaned Fusion InstallPlans"
+          ansible.builtin.set_fact:
+            fusion_orphan_plans: "{{ fusion_owned_plans if (fusion_subscriptions | length == 0) else [] }}"
+
+        - name: "04 | Refuse ambiguous duplicate Fusion Subscriptions"
+          ansible.builtin.assert:
+            that:
+              - fusion_subscriptions | length <= 1
+            fail_msg: "Multiple Fusion Subscriptions in {{ fusion_namespace }}: investigate before deployment"
+
+        - name: "04 | Refuse Subscription with Automatic InstallPlan approval"
+          ansible.builtin.assert:
+            that:
+              - item.spec.installPlanApproval | default('') == 'Manual'
+            success_msg: "PASS - Fusion Subscription requires Manual approval"
+            fail_msg: "UNSAFE - Fusion Subscription is not set to Manual approval"
+          loop: "{{ fusion_subscriptions }}"
+          loop_control:
+            label: "{{ item.metadata.name }}"
+
+        - name: "04 | Extract InstallPlan reference from Fusion Subscription"
+          ansible.builtin.set_fact:
+            fusion_plan_name: >-
+              {{ fusion_subscriptions[0].status.installplan.name | default('')
+                 if (fusion_subscriptions | length > 0) else '' }}
+
+        - name: "04 | Select referenced InstallPlan, if OLM has created one"
+          ansible.builtin.set_fact:
+            fusion_referenced_plans: >-
+              {{ fusion_namespace_plans
+                 | selectattr('metadata.name', 'equalto', fusion_plan_name) | list
+                 if fusion_plan_name | length > 0 else [] }}
+
+        - name: "05 | Validate Fusion-owned InstallPlans without expanding huge JSON in the console"
+          ansible.builtin.assert:
+            that:
+              - >-
+                (fusion_owned_plans | rejectattr('spec.approval', 'equalto', 'Manual') | list | length) == 0
+            fail_msg: 'REVIEW REQUIRED - Some Fusion-owned InstallPlans are not Manual'
+            success_msg: 'PASS - Every Fusion-owned InstallPlan requires Manual approval'
+
+        - name: "05 | Refuse an ambiguous InstallPlan reference"
+          ansible.builtin.assert:
+            that:
+              - fusion_referenced_plans | length <= 1
+            fail_msg: "More than one InstallPlan matched the Subscription reference"
+
+        - name: "05 | Validate referenced InstallPlan has Manual policy and expected CSV"
+          ansible.builtin.assert:
+            that:
+              - (item.spec.approval | default('')) == 'Manual'
+              - expected_fusion_csv in (item.spec.clusterServiceVersionNames | default([]))
+            success_msg: "PASS - Referenced InstallPlan is Manual and targets {{ expected_fusion_csv }}"
+            fail_msg: "REVIEW REQUIRED - InstallPlan policy/version does not match expected values"
+          loop: "{{ fusion_referenced_plans }}"
+          loop_control:
+            label: "{{ item.metadata.name }}"
+
+        - name: "06 | Show concise Operator review"
+          ansible.builtin.debug:
+            msg:
+              - "READ-ONLY: {{ api_server.stdout | trim }}; identity={{ identity.stdout | trim }}"
+              - "Kubeconfig={{ kubeconfig_path }}; API pinned={{ expected_api_server | length > 0 }}"
+              - "Fusion Subscription count={{ fusion_subscriptions | length }}"
+              - "Fusion-owned InstallPlans found={{ fusion_owned_plans | length }}"
+              - "Orphaned Fusion InstallPlans={{ fusion_orphan_plans | length }}"
+              - "Orphan plan names={{ fusion_orphan_plans | map(attribute='metadata.name') | list }}"
+              - "Orphan plan UIDs={{ fusion_orphan_plans | map(attribute='metadata.uid') | list }}"
+              - "Original owner refs are retained; see orphan approval audit for exact owner UID"
+              - "Referenced InstallPlan={{ fusion_plan_name if fusion_plan_name | length > 0 else 'none yet' }}"
+              - "Referenced InstallPlan found={{ fusion_referenced_plans | length > 0 }}"
+              - "Expected successful CSV count={{ fusion_successful_csvs | length }}"
+              - >-
+                State={{ 'ALREADY INSTALLED - Operator is succeeded'
+                if fusion_successful_csvs | length > 0 else
+                'ORPHANED INSTALLPLAN - BLOCKED. Do NOT approve or recreate Subscription until reconciled'
+                if fusion_orphan_plans | length > 0 else
+                'NOT STARTED - no Fusion Subscription or Fusion-owned InstallPlan'
+                if fusion_subscriptions | length == 0 else
+                'UNREFERENCED FUSION INSTALLPLAN - REVIEW NEEDED'
+                if (fusion_referenced_plans | length == 0 and fusion_owned_plans | length > 0) else
+                'WAITING - OLM has not yet referenced an InstallPlan'
+                if fusion_referenced_plans | length == 0 else
+                'MANUAL REVIEW NEEDED - do not approve until plan contents are examined' }}
+              - "No InstallPlan approval or cluster modifications performed"
+
+    - name: "99 | Complete read-only InstallPlan audit"
+      ansible.builtin.debug:
+        msg: "PASS - Stage 4M finished without applying, approving, or modifying resources"

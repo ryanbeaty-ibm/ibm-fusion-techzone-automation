@@ -1,0 +1,244 @@
+---
+# Install IBM Fusion Data Foundation 4.21 through Fusion's own service API.
+# No local disks or PVs are claimed by this playbook.
+- name: 'LAB | Install IBM Fusion Data Foundation Local service'
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    kubeconfig_path: ''
+    expected_api_server: ''
+    protected_api_server: ''
+    expected_ocp_minor: '4.21'
+    fusion_namespace: ibm-spectrum-fusion-ns
+    odf_service_name: odfmanager
+    odf_storage_namespace: openshift-storage
+    odf_apply: false
+    odf_local_volume_name: fusion-ceph-local
+    odf_local_storage_class: fusion-ceph-local
+    odf_storage_nodes: []
+    odf_candidate_device: ''
+  tasks:
+    - name: '00 | Require pinned LAB and one-run service authorization'
+      ansible.builtin.assert:
+        that:
+          - odf_apply | bool
+          - kubeconfig_path | length > 0
+          - kubeconfig_path != (lookup('env', 'HOME') ~ '/.kube/config')
+          - expected_api_server is match('^https://[^/]+:6443$')
+          - expected_api_server != protected_api_server
+          - odf_storage_namespace == 'openshift-storage'
+        fail_msg: 'BLOCKED: Explicit target and odf_apply=true are mandatory.'
+
+    - name: '00 | Resolve connected API'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami, --show-server]
+      register: odf_api
+      changed_when: false
+
+    - name: '00 | Refuse wrong cluster'
+      ansible.builtin.assert:
+        that:
+          - odf_api.stdout | trim == expected_api_server
+          - odf_api.stdout | trim != protected_api_server
+
+    - name: '01 | Inspect Fusion Data Foundation service definition'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, fusionservicedefinition, data-foundation-service, -n, '{{ fusion_namespace }}', -o, json]
+      register: odf_def_raw
+      changed_when: false
+
+    - name: '01 | Verify Fusion 2.14.1 exposes local ODF for OCP 4.21'
+      ansible.builtin.assert:
+        that:
+          - (odf_def_raw.stdout | from_json).status.isDeployable | bool
+          - (odf_def_raw.stdout | from_json).status.isSupported | bool
+          - (odf_def_raw.stdout | from_json).status.ocpVersion == 'ocp421'
+          - (odf_def_raw.stdout | from_json).spec.onboarding.resourceKind == 'OdfManager'
+          - (odf_def_raw.stdout | from_json).spec.onboarding.serviceInstanceName == 'odfmanager'
+          - (odf_def_raw.stdout | from_json).spec.onboarding.groupName == 'odf.isf.ibm.com'
+          - (odf_def_raw.stdout | from_json).status.platform == 'BareMetalSDS'
+        fail_msg: 'BLOCKED: IBM Fusion Data Foundation service definition differs from Lab #2 expectations.'
+
+    - name: '02 | Inspect existing Data Foundation service instance'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, fusionserviceinstance, '{{ odf_service_name }}', -n, '{{ fusion_namespace }}', -o, json, --ignore-not-found]
+      register: odf_fsi_raw
+      changed_when: false
+
+    - name: '02 | Decode existing Data Foundation settings'
+      ansible.builtin.set_fact:
+        odf_existing_fsi: "{{ (odf_fsi_raw.stdout | from_json) if (odf_fsi_raw.stdout | trim | length > 0) else {} }}"
+
+    - name: '02 | Extract the stored backing type'
+      ansible.builtin.set_fact:
+        odf_existing_backing: "{{ ((odf_existing_fsi.get('spec', {}).get('parameters', []) | selectattr('name', 'equalto', 'backingStorageType') | map(attribute='value') | list) | first) | default('') }}"
+
+    # Fusion can report Dynamic after creation of local Ceph resources.
+    # Never accept that on its own; prove the matching exact-device topology exists.
+    - name: '02 | Inspect existing local device claim when backing says Dynamic'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, localvolume, '{{ odf_local_volume_name }}', -n, openshift-local-storage, -o, json, --ignore-not-found]
+      register: odf_dynamic_lv_raw
+      changed_when: false
+      when: odf_existing_backing == 'Dynamic'
+
+    - name: '02 | Inspect existing Ceph cluster when backing says Dynamic'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, storagecluster, ocs-storagecluster, -n, '{{ odf_storage_namespace }}', -o, json, --ignore-not-found]
+      register: odf_dynamic_sc_raw
+      changed_when: false
+      when: odf_existing_backing == 'Dynamic'
+
+    - name: '02 | Require exact local Ceph topology before tolerating Dynamic'
+      ansible.builtin.assert:
+        that:
+          - (odf_dynamic_lv_raw.stdout | default('') | trim | length) > 0
+          - (odf_dynamic_sc_raw.stdout | default('') | trim | length) > 0
+          - odf_existing_fsi.status.health | default('') == 'Healthy'
+          - (odf_dynamic_lv_raw.stdout | from_json).spec.storageClassDevices | length == 1
+          - (odf_dynamic_lv_raw.stdout | from_json).spec.storageClassDevices[0].storageClassName == odf_local_storage_class
+          - (odf_dynamic_lv_raw.stdout | from_json).spec.storageClassDevices[0].devicePaths == [odf_candidate_device]
+          - (odf_dynamic_lv_raw.stdout | from_json).spec.storageClassDevices[0].volumeMode == 'Block'
+          - (((odf_dynamic_lv_raw.stdout | from_json).spec.nodeSelector.nodeSelectorTerms[0].matchExpressions[0]['values']) | sort | list) == (odf_storage_nodes | sort | list)
+          - (odf_dynamic_sc_raw.stdout | from_json).status.phase | default('') == 'Ready'
+          - (odf_dynamic_sc_raw.stdout | from_json).spec.storageDeviceSets | length == 1
+          - (odf_dynamic_sc_raw.stdout | from_json).spec.storageDeviceSets[0].dataPVCTemplate.spec.storageClassName == odf_local_storage_class
+          - (odf_dynamic_sc_raw.stdout | from_json).spec.storageDeviceSets[0].replica | int == 3
+        fail_msg: 'BLOCKED: Dynamic service without exact, healthy preexisting local Ceph topology. Refusing to create or change storage.'
+        quiet: true
+      when: odf_existing_backing == 'Dynamic'
+
+    - name: '02 | Preserve only recognized Data Foundation service instances'
+      ansible.builtin.assert:
+        that:
+          - (odf_existing_fsi | length == 0) or (odf_existing_fsi.spec.serviceDefinition == 'data-foundation-service')
+          - (odf_existing_fsi | length == 0) or (odf_existing_backing in ['Local', 'Dynamic'])
+        fail_msg: 'BLOCKED: Data Foundation definition or backing type differs from supported lab states.'
+        quiet: true
+
+    - name: '03 | Create Local Data Foundation FusionServiceInstance if absent'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', create, -f, -]
+        stdin: |
+          apiVersion: service.isf.ibm.com/v1
+          kind: FusionServiceInstance
+          metadata:
+            name: {{ odf_service_name }}
+            namespace: {{ fusion_namespace }}
+          spec:
+            creator: User
+            doInstall: true
+            parameters:
+              - name: namespace
+                provided: false
+                value: {{ odf_storage_namespace }}
+              - name: creator
+                provided: false
+                value: Fusion
+              - name: backingStorageType
+                provided: true
+                value: Local
+              - name: autoUpgrade
+                provided: false
+                value: 'true'
+              - name: enableLVMStorage
+                provided: true
+                value: 'false'
+            serviceDefinition: data-foundation-service
+            triggerUpdate: false
+      when: odf_fsi_raw.stdout | trim | length == 0
+
+    - name: '04 | Wait for IBM Data Foundation service to become healthy (up to 30 min)'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, fusionserviceinstance, '{{ odf_service_name }}', -n, '{{ fusion_namespace }}', -o, json]
+      register: odf_service_wait
+      changed_when: false
+      until: >-
+        (odf_service_wait.stdout | from_json).status.health | default('') == 'Healthy'
+        or
+        ((odf_service_wait.stdout | from_json).status.installStatus.status | default('') == 'Completed'
+         and (odf_service_wait.stdout | from_json).status.health | default('') not in ['Degraded', 'Failing'])
+      retries: 120
+      delay: 15
+
+    # 'oc wait crd/foo' fails immediately when a CRD does not exist yet.
+    # Poll GET --ignore-not-found until the CRD both exists and is Established.
+    # If it never appears, collect service/operator diagnostics instead of
+    # incorrectly proceeding to any storage claims.
+    - name: '05 | Wait for ODF and Local Storage APIs to register'
+      block:
+        - name: '05 | Wait for each CRD to exist AND report Established (up to 15 min each)'
+          ansible.builtin.command:
+            argv:
+              - oc
+              - '--kubeconfig={{ kubeconfig_path }}'
+              - get
+              - crd
+              - '{{ item }}'
+              - -o
+              - json
+              - --ignore-not-found
+          register: odf_crd_probe
+          changed_when: false
+          until: >-
+            odf_crd_probe.rc == 0
+            and (odf_crd_probe.stdout | trim | length > 0)
+            and
+            (((odf_crd_probe.stdout | from_json).status.conditions | default([])
+              | selectattr('type', 'equalto', 'Established')
+              | map(attribute='status') | list) == ['True'])
+          retries: 90
+          delay: 10
+          loop:
+            - localvolumes.local.storage.openshift.io
+            - storageclusters.ocs.openshift.io
+          loop_control:
+            label: '{{ item }}'
+
+      rescue:
+        - name: '05 | Capture Fusion Data Foundation instance status'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, fusionserviceinstance, '{{ odf_service_name }}', -n, '{{ fusion_namespace }}', -o, json]
+          register: odf_diag_instance
+          changed_when: false
+          failed_when: false
+
+        - name: '05 | Capture installed ODF operator CSVs'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, csv, -n, '{{ odf_storage_namespace }}', -o, 'custom-columns=NAME:.metadata.name,PHASE:.status.phase']
+          register: odf_diag_csvs
+          changed_when: false
+          failed_when: false
+
+        - name: '05 | Capture ODF subscriptions'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, subscription, -n, '{{ odf_storage_namespace }}', -o, 'custom-columns=NAME:.metadata.name,STATE:.status.state']
+          register: odf_diag_subs
+          changed_when: false
+          failed_when: false
+
+        - name: '05 | Capture ODF pods'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, pods, -n, '{{ odf_storage_namespace }}', -o, wide]
+          register: odf_diag_pods
+          changed_when: false
+          failed_when: false
+
+        - name: '05 | Report actionable ODF diagnostics (no disks claimed)'
+          ansible.builtin.debug:
+            msg:
+              - "Fusion service health={{ ((odf_diag_instance.stdout | from_json).get('status', {}).get('health', 'Unknown')) if (odf_diag_instance.rc == 0 and odf_diag_instance.stdout | trim | length > 0) else 'Unavailable' }}"
+              - "Fusion service install status={{ ((odf_diag_instance.stdout | from_json).get('status', {}).get('installStatus', {}).get('status', 'Unknown')) if (odf_diag_instance.rc == 0 and odf_diag_instance.stdout | trim | length > 0) else 'Unavailable' }}"
+              - 'ODF CSVs: {{ odf_diag_csvs.stdout | default(odf_diag_csvs.stderr) }}'
+              - 'ODF Subscriptions: {{ odf_diag_subs.stdout | default(odf_diag_subs.stderr) }}'
+              - 'ODF Pods: {{ odf_diag_pods.stdout | default(odf_diag_pods.stderr) }}'
+
+        - name: '05 | Stop before any disk claim when ODF API is not ready'
+          ansible.builtin.fail:
+            msg: 'BLOCKED: Data Foundation has not registered required APIs. Check diagnostic results. No local disks or Ceph StorageCluster were created by this stage.'
+
+    - name: '99 | Data Foundation service installation state'
+      ansible.builtin.debug:
+        msg: 'Local Data Foundation OdfManager present and LocalVolume / StorageCluster APIs Established. No storage disks claimed by this playbook.'

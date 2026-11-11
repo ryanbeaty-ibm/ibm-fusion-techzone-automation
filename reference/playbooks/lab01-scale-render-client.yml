@@ -1,0 +1,31 @@
+---
+- name: Lab 01 | Render dedicated Scale data-access client Cluster manifest (no apply)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    manifest_dir: '{{ playbook_dir }}/../build/scale-lab01'
+  tasks:
+    - name: Require correct Lab 01 target, worker nodes, namespace, license, and approval
+      ansible.builtin.assert:
+        that:
+          - kubeconfig == '/home/automation/.kube/lab01.conf'
+          - (scale_nodes | sort) == (['itz-s6fyum-worker-1','itz-s6fyum-worker-2','itz-s6fyum-worker-3'] | sort)
+          - scale_namespace == 'ibm-spectrum-scale'
+          - scale_license == 'data-access'
+          - scale_apply_enabled | bool
+        fail_msg: 'Refusing to render for any other cluster or node set.'
+    - name: Create restricted build folder
+      ansible.builtin.file:
+        path: '{{ manifest_dir }}'
+        state: directory
+        mode: '0700'
+    - name: Render the data-access client with the SAME Scale node-role selector verified by deployment
+      ansible.builtin.template:
+        src: '{{ playbook_dir }}/../templates/01-cluster-lab01.yaml.j2'
+        dest: '{{ manifest_dir }}/01-cluster.yaml'
+        mode: '0600'
+    - name: Validate generated Cluster with the Kubernetes API (dry run; no cluster changes)
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, '{{ scale_namespace }}', apply, '--dry-run=server', '--validate=strict', -f, '{{ manifest_dir }}/01-cluster.yaml']
+      changed_when: false

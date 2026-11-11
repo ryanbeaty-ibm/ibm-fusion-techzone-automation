@@ -1,0 +1,163 @@
+---
+# Phase 4S | Compare a known-good Data Foundation ServiceInstance to a draft.
+# Defaults to READ ONLY; there is no Ansible task that creates/updates/deletes
+# OpenShift resources or approves storage devices.
+# Draft source: IBM Fusion 2.13 CLI example (review for deployed 2.14.1).
+- name: 'Phase 4S | Compare installed Data Foundation configuration to review-only draft'
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    scenario: live
+    kubeconfig_path: "{{ lookup('env', 'HOME') }}/.kube/config"
+    expected_api_server: ''
+    fusion_namespace: ibm-spectrum-fusion-ns
+    service_instance_name: odfmanager
+    s_known_parameters:
+      - namespace
+      - creator
+      - backingStorageType
+      - autoUpgrade
+      - enableLVMStorage
+    s_expected_parameters:
+      namespace: openshift-storage
+      creator: Fusion
+      backingStorageType: Local
+      autoUpgrade: 'false'
+      enableLVMStorage: 'false'
+  tasks:
+    - name: '00 | Require review-only mode and reject write-capable flags'
+      ansible.builtin.assert:
+        that:
+          - scenario in ['live', 'empty', 'fusion_initialized', 'service_installed']
+          - not (deploy | default(false) | bool)
+          - not (apply | default(false) | bool)
+          - not (install_data_foundation | default(false) | bool)
+          - not (approve_disk_claim | default(false) | bool)
+          - not (generate_manifest | default(false) | bool)
+          - not (initialize_fusion | default(false) | bool)
+          - not (operator_phase_apply | default(false) | bool)
+          - not (approve_fusion_installplan | default(false) | bool)
+        success_msg: 'PASS - Phase 4S is review-only; no write path exists'
+        fail_msg: 'BLOCKED - Unsupported mode or deployment flag.'
+
+    - name: '01 | Run offline planning simulation (no OpenShift calls)'
+      ansible.builtin.debug:
+        msg:
+          - 'SIMULATION={{ scenario }}; no OpenShift API calls'
+          - >-
+              {{ 'Install and initialize Fusion first' if scenario == 'empty' else
+                 'ServiceInstance creation requires independently reviewed 2.14.1 manifest and disk/capacity prerequisites'
+                 if scenario == 'fusion_initialized' else
+                 'Already installed: compare the running service configuration; never recreate it' }}
+          - 'Never apply the example manifest in simulation.'
+      when: scenario != 'live'
+
+    - name: '02 | Compare against live known-good configuration (read-only)'
+      when: scenario == 'live'
+      block:
+        - name: '02 | Require kubeconfig file'
+          ansible.builtin.stat:
+            path: '{{ kubeconfig_path }}'
+          register: s_kube
+
+        - name: '02 | Require regular kubeconfig and explicit API pin'
+          ansible.builtin.assert:
+            that:
+              - s_kube.stat.isreg | default(false)
+              - expected_api_server | length > 0
+            fail_msg: 'BLOCKED - Supply readable kubeconfig and explicit expected_api_server.'
+
+        - name: '02 | Resolve target API endpoint'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami, --show-server]
+          register: s_api
+          changed_when: false
+
+        - name: '02 | Confirm exact POC API endpoint'
+          ansible.builtin.assert:
+            that:
+              - (s_api.stdout | trim) == (expected_api_server | trim)
+            fail_msg: 'BLOCKED - The kubeconfig points to a different OpenShift API.'
+
+        - name: '03 | Read Data Foundation instances (across namespaces)'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, fusionserviceinstances.service.isf.ibm.com, -A, -o, json]
+          register: s_services_raw
+          changed_when: false
+
+        - name: '03 | Read existing StorageClusters (across namespaces)'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, storageclusters.ocs.openshift.io, -A, -o, json]
+          register: s_storage_raw
+          changed_when: false
+
+        - name: '04 | Select precisely the existing known-good service'
+          ansible.builtin.set_fact:
+            s_services: '{{ (s_services_raw.stdout | from_json)["items"] }}'
+            s_storages: '{{ (s_storage_raw.stdout | from_json)["items"] }}'
+
+        - name: '04 | Check no unexpected services or storage clusters exist'
+          ansible.builtin.assert:
+            that:
+              - s_services | length == 1
+              - s_storages | length == 1
+              - s_services[0].metadata.namespace == fusion_namespace
+              - s_services[0].metadata.name == service_instance_name
+              - s_storages[0].metadata.namespace == 'openshift-storage'
+              - s_storages[0].metadata.name == 'ocs-storagecluster'
+            fail_msg: 'BLOCKED - This is not the expected completed POC service. No blueprint comparison performed.'
+
+        - name: '04 | Require healthy source and known service definition'
+          ansible.builtin.assert:
+            that:
+              - s_services[0].status.health | default('') == 'Healthy'
+              - s_services[0].status.installStatus.status | default('') == 'Completed'
+              - s_storages[0].status.phase | default('') == 'Ready'
+              - s_services[0].spec.serviceDefinition | default('') == 'data-foundation-service'
+            fail_msg: 'BLOCKED - Source service must be healthy and completed before comparison.'
+            success_msg: 'PASS - Known-good Data Foundation reference is Healthy / Completed; Ceph Ready'
+
+        - name: '05 | Read only known, non-sensitive installation parameters'
+          ansible.builtin.set_fact:
+            s_parameters: >-
+              {{ s_services[0].spec.parameters | default([]) |
+                 selectattr('name', 'in', s_known_parameters) | list }}
+            s_unknown_parameters: >-
+              {{ s_services[0].spec.parameters | default([]) |
+                 rejectattr('name', 'in', s_known_parameters) |
+                 map(attribute='name') | list }}
+
+        - name: '05 | Show observed parameters next to draft values'
+          ansible.builtin.debug:
+            msg: >-
+              {{ item.name }}: observed_value={{ item.value | default('not set') }};
+              observed_provided={{ item.provided | default('not set') }};
+              draft_value={{ s_expected_parameters[item.name] }}
+          loop: '{{ s_parameters }}'
+          loop_control:
+            label: '{{ item.name }}'
+
+        - name: '05 | Report parameters absent in the installed reference'
+          ansible.builtin.debug:
+            msg:
+              - >-
+                  Known parameter names observed={{ s_parameters | map(attribute='name') | list | join(', ') }}
+              - >-
+                  Additional parameter names omitted from output={{ s_unknown_parameters | join(', ') if s_unknown_parameters | length > 0 else 'none' }}
+              - >-
+                  Parameters present in documentation draft but absent from POC={{ s_known_parameters | difference(s_parameters | map(attribute='name') | list) | join(', ') if (s_known_parameters | difference(s_parameters | map(attribute='name') | list)) | length > 0 else 'none' }}
+
+        - name: '06 | Report deployment-manifest review checkpoint'
+          ansible.builtin.debug:
+            msg:
+              - 'STATE=REFERENCE_CAPTURED - POC service verified; no cluster changes'
+              - 'The separate draft YAML uses doInstall=true; completed POC may show doInstall=false.'
+              - 'Draft assumes Local backing, no LVM, and disabled automatic updates; review against observed fields.'
+              - 'The draft follows IBM Fusion 2.13 CLI guidance and still requires 2.14.1 compatibility, registry/capacity checks, and disk approval before any installation.'
+              - 'Do NOT apply the packaged draft to either environment.'
+
+    - name: '99 | Finish Phase 4S'
+      ansible.builtin.debug:
+        msg: 'PASS - Phase 4S comparison/simulation finished; OpenShift resources unchanged.'

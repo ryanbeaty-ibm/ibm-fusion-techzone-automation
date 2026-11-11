@@ -1,0 +1,245 @@
+---
+# Explicit local-device provisioning stage. USE ONLY for reviewed lab disks.
+- name: 'LAB | Configure exact devices and IBM Fusion Ceph StorageCluster'
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    kubeconfig_path: ''
+    expected_api_server: ''
+    protected_api_server: ''
+    odf_storage_nodes: []
+    odf_candidate_device: ''
+    odf_local_volume_name: fusion-ceph-local
+    odf_local_storage_class: fusion-ceph-local
+    odf_storage_namespace: openshift-storage
+    odf_lso_namespace: openshift-local-storage
+    odf_pvc_request: 400Gi
+    approve_disk_claim: false
+  tasks:
+    - name: '00 | Require explicit one-run disk claim authorization'
+      ansible.builtin.assert:
+        that:
+          - approve_disk_claim | bool
+          - expected_api_server is match('^https://[^/]+:6443$')
+          - expected_api_server != protected_api_server
+          - kubeconfig_path | length > 0
+          - kubeconfig_path != (lookup('env', 'HOME') ~ '/.kube/config')
+          - odf_storage_nodes | length == 3
+          - odf_storage_nodes | unique | list | length == 3
+          - odf_candidate_device is match('^/dev/[a-zA-Z0-9]+$')
+          - odf_candidate_device not in ['/dev/vda', '/dev/sda', '/dev/nvme0n1']
+          - odf_storage_namespace == 'openshift-storage'
+          - odf_lso_namespace == 'openshift-local-storage'
+          - odf_local_storage_class is match('^[a-z][a-z0-9-]{2,39}$')
+        fail_msg: 'BLOCKED: --claim-disks and pinned 3-node reviewed device config are required.'
+
+    - name: '00 | Resolve API'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami, --show-server]
+      register: odf_connected
+      changed_when: false
+
+    - name: '00 | Reject protected and wrong clusters'
+      ansible.builtin.assert:
+        that:
+          - odf_connected.stdout | trim == expected_api_server
+          - odf_connected.stdout | trim != protected_api_server
+
+    - name: '01 | Ensure LSO and StorageCluster APIs are established'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', wait, '--for=condition=Established', 'crd/{{ item }}', '--timeout=180s']
+      loop:
+        - localvolumes.local.storage.openshift.io
+        - storageclusters.ocs.openshift.io
+      changed_when: false
+
+    - name: '01 | Refuse a conflicting preexisting StorageCluster before claiming anything'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, storageclusters, -A, -o, json]
+      register: odf_preexisting_clusters
+      changed_when: false
+
+    - name: '01 | Confirm this cluster has no foreign Ceph StorageClusters'
+      ansible.builtin.assert:
+        that:
+          - ((odf_preexisting_clusters.stdout | from_json)["items"] | rejectattr('metadata.name', 'equalto', 'ocs-storagecluster') | list | length) == 0
+          - ((odf_preexisting_clusters.stdout | from_json)["items"] | rejectattr('metadata.namespace', 'equalto', odf_storage_namespace) | list | length) == 0
+        fail_msg: 'BLOCKED: existing foreign Ceph StorageCluster; no disk claims permitted.'
+
+    - name: '01 | Read current LocalVolumes'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, localvolumes, -A, -o, json]
+      register: odf_localvolumes
+      changed_when: false
+
+    - name: '01 | Check whether the LocalVolumeSet API exists'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, crd, localvolumesets.local.storage.openshift.io, -o, name, --ignore-not-found]
+      register: odf_localvolumesets_crd
+      changed_when: false
+
+    - name: '01 | Read current LocalVolumeSets when API exists'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, localvolumesets, -A, -o, json]
+      register: odf_localvolumesets
+      changed_when: false
+      when: odf_localvolumesets_crd.stdout | trim | length > 0
+
+    - name: '01 | Reject unrelated preexisting local-volume claims'
+      ansible.builtin.assert:
+        that:
+          - ((odf_localvolumes.stdout | from_json)["items"] | rejectattr('metadata.name', 'equalto', odf_local_volume_name) | list | length) == 0
+          - ((odf_localvolumes.stdout | from_json)["items"] | rejectattr('metadata.namespace', 'equalto', odf_lso_namespace) | list | length) == 0
+          - (odf_localvolumesets_crd.stdout | trim | length == 0) or ((odf_localvolumesets.stdout | default('{"items":[]}', true) | from_json)["items"] | length == 0)
+        fail_msg: 'BLOCKED: unexpected LSO local storage resources exist. Do not double-claim disks.'
+
+    - name: '02 | Inspect existing exact-device LocalVolume'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, localvolume, '{{ odf_local_volume_name }}', -n, '{{ odf_lso_namespace }}', -o, json, --ignore-not-found]
+      register: odf_lv_raw
+      changed_when: false
+
+    - name: '02 | Validate any existing LocalVolume mapping before reusing'
+      ansible.builtin.assert:
+        that:
+          - (odf_lv_raw.stdout | trim | length == 0) or ((odf_lv_raw.stdout | from_json).spec.storageClassDevices | length == 1)
+          - (odf_lv_raw.stdout | trim | length == 0) or ((odf_lv_raw.stdout | from_json).spec.storageClassDevices[0].storageClassName == odf_local_storage_class)
+          - (odf_lv_raw.stdout | trim | length == 0) or ((odf_lv_raw.stdout | from_json).spec.storageClassDevices[0].devicePaths == [odf_candidate_device])
+          - (odf_lv_raw.stdout | trim | length == 0) or ((odf_lv_raw.stdout | from_json).spec.storageClassDevices[0].volumeMode == 'Block')
+          - (odf_lv_raw.stdout | trim | length == 0) or (((odf_lv_raw.stdout | from_json).spec.nodeSelector.nodeSelectorTerms[0].matchExpressions[0]["values"] | sort | list) == (odf_storage_nodes | sort | list))
+        fail_msg: 'BLOCKED: existing LocalVolume does not match the configured exact node/device map.'
+
+    - name: '03 | Label only selected nodes for ODF storage if needed'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, node, '{{ item }}', -o, json]
+      loop: '{{ odf_storage_nodes }}'
+      register: odf_nodes_raw
+      changed_when: false
+
+    - name: '03 | Require all selected nodes Ready'
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - (((item.stdout | from_json).status.conditions | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | list) == ['True'])
+        fail_msg: 'BLOCKED: selected node is not Ready.'
+      loop: '{{ odf_nodes_raw.results }}'
+      loop_control:
+        label: '{{ item.item }}'
+
+    - name: '03 | Apply ODF placement labels to selected nodes only'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', label, node, '{{ item.item }}', 'cluster.ocs.openshift.io/openshift-storage=']
+      loop: '{{ odf_nodes_raw.results }}'
+      loop_control:
+        label: '{{ item.item }}'
+      when: "'cluster.ocs.openshift.io/openshift-storage' not in (item.stdout | from_json).metadata.labels"
+
+    - name: '04 | Create one exact-device LocalVolume (no broad disk discovery; no wiping)'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', create, -f, -]
+        stdin: |
+          apiVersion: local.storage.openshift.io/v1
+          kind: LocalVolume
+          metadata:
+            name: {{ odf_local_volume_name }}
+            namespace: {{ odf_lso_namespace }}
+          spec:
+            managementState: Managed
+            nodeSelector:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: kubernetes.io/hostname
+                      operator: In
+                      values:
+          {% for node in odf_storage_nodes %}
+                        - {{ node }}
+          {% endfor %}
+            storageClassDevices:
+              - storageClassName: {{ odf_local_storage_class }}
+                forceWipeDevicesAndDestroyAllData: false
+                volumeMode: Block
+                devicePaths:
+                  - {{ odf_candidate_device }}
+      when: odf_lv_raw.stdout | trim | length == 0
+
+    - name: '05 | Wait for exactly three local PVs (up to 15 min)'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, pv, -o, json]
+      register: odf_pvs_wait
+      changed_when: false
+      until: >-
+        ((odf_pvs_wait.stdout | from_json)["items"] |
+         selectattr('spec.storageClassName', 'equalto', odf_local_storage_class) | list | length) == 3
+        and
+        ((odf_pvs_wait.stdout | from_json)["items"] |
+         selectattr('spec.storageClassName', 'equalto', odf_local_storage_class) |
+         selectattr('status.phase', 'in', ['Available', 'Bound']) | list | length) == 3
+      retries: 90
+      delay: 10
+
+    - name: '05 | Verify all three PVs are raw Block and not owned by another class'
+      ansible.builtin.assert:
+        that:
+          - (odf_pvs_wait.stdout | from_json)["items"] | selectattr('spec.storageClassName', 'equalto', odf_local_storage_class) | selectattr('spec.volumeMode', 'equalto', 'Block') | list | length == 3
+          - (odf_pvs_wait.stdout | from_json)["items"] | selectattr('spec.storageClassName', 'equalto', odf_local_storage_class) | rejectattr('status.phase', 'in', ['Available', 'Bound']) | list | length == 0
+        fail_msg: 'BLOCKED: local PV count or phase/mode is not the expected three block devices.'
+
+    - name: '06 | Inspect any existing Ceph StorageCluster'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, storagecluster, ocs-storagecluster, -n, '{{ odf_storage_namespace }}', -o, json, --ignore-not-found]
+      register: odf_sc_raw
+      changed_when: false
+
+    - name: '06 | Reject an unexpected existing StorageCluster'
+      ansible.builtin.assert:
+        that:
+          - (odf_sc_raw.stdout | trim | length == 0) or ((odf_sc_raw.stdout | from_json).spec.storageDeviceSets | length == 1)
+          - (odf_sc_raw.stdout | trim | length == 0) or ((odf_sc_raw.stdout | from_json).spec.storageDeviceSets[0].dataPVCTemplate.spec.storageClassName == odf_local_storage_class)
+          - (odf_sc_raw.stdout | trim | length == 0) or ((odf_sc_raw.stdout | from_json).spec.storageDeviceSets[0].replica | int == 3)
+        fail_msg: 'BLOCKED: existing StorageCluster does not match intended local Ceph topology.'
+
+    - name: '07 | Create local Ceph StorageCluster using exactly three local PVs'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', create, -f, -]
+        stdin: |
+          apiVersion: ocs.openshift.io/v1
+          kind: StorageCluster
+          metadata:
+            name: ocs-storagecluster
+            namespace: {{ odf_storage_namespace }}
+          spec:
+            manageNodes: false
+            monDataDirHostPath: /var/lib/rook
+            storageDeviceSets:
+              - name: ocs-deviceset
+                count: 1
+                replica: 3
+                portable: false
+                deviceType: SSD
+                placement: {}
+                resources: {}
+                dataPVCTemplate:
+                  spec:
+                    accessModes:
+                      - ReadWriteOnce
+                    resources:
+                      requests:
+                        storage: {{ odf_pvc_request }}
+                    storageClassName: {{ odf_local_storage_class }}
+                    volumeMode: Block
+      when: odf_sc_raw.stdout | trim | length == 0
+
+    - name: '08 | Wait for StorageCluster Ready (up to 30 min)'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, storagecluster, ocs-storagecluster, -n, '{{ odf_storage_namespace }}', -o, json]
+      register: odf_cluster_wait
+      changed_when: false
+      until: (odf_cluster_wait.stdout | from_json).status.phase | default('') == 'Ready'
+      retries: 120
+      delay: 15
+
+    - name: '99 | Storage deployment summary'
+      ansible.builtin.debug:
+        msg: 'PASS: LocalVolume={{ odf_local_volume_name }}, exactly three selected {{ odf_candidate_device }} PVs, Ceph StorageCluster Ready.'

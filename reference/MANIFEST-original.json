@@ -1,0 +1,19 @@
+{
+  "release": "v0.1-alpha",
+  "source_sha256": "f8a1ef4c95f7de31eee870a5d1673d14b384ec55a453fef746dd181af35d446f",
+  "internal_sources": [
+    "preflight-fresh-cluster-stage4t.yml",
+    "prepare-fusion-operator-stage4l.yml",
+    "review-fusion-installplan-stage4m.yml",
+    "review-approve-fusion-installplan-stage4n.yml",
+    "verify-fusion-operator-stage4o.yml",
+    "inspect-spectrumfusion-stage4p.yml",
+    "initialize-spectrumfusion-stage4q.yml",
+    "inspect-data-foundation-stage4r.yml"
+  ],
+  "user_entrypoints": [
+    "playbooks/preflight.yml",
+    "playbooks/install.yml",
+    "playbooks/verify.yml"
+  ]
+}

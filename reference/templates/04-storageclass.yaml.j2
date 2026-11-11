@@ -1,0 +1,14 @@
+# DRAFT ONLY. Apply only after RemoteCluster and Filesystem are Ready.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ scale_storageclass }}
+provisioner: spectrumscale.csi.ibm.com
+parameters:
+  clusterId: '{{ scale_cluster_id }}'
+  volBackendFs: '{{ scale_filesystem }}-{{ scale_cluster_id }}'
+  version: '2'
+  shared: 'false'
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+volumeBindingMode: Immediate

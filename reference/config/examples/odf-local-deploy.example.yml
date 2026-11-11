@@ -1,0 +1,12 @@
+---
+# Copy to config/local/odf-lab-2.yml. Lab #2 only. Review disk mapping before claiming.
+odf_storage_nodes:
+  - itz-d4xrcs-infra-1
+  - itz-d4xrcs-infra-2
+  - itz-d4xrcs-infra-3
+odf_candidate_device: /dev/vde
+odf_min_disk_bytes: 400000000000
+odf_require_nonrotational: true
+odf_local_volume_name: fusion-ceph-local
+odf_local_storage_class: fusion-ceph-local
+odf_pvc_request: 400Gi

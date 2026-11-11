@@ -1,0 +1,76 @@
+---
+# Consolidated entry point 2/3. STAGED, controlled bootstrap, NOT a finished end-to-end installer.
+# Audit by default. Write stages require the ORIGINAL stage-specific approvals.
+# NO Data Foundation creation, LocalVolumeSet apply, or disk claim is implemented.
+- name: 'Install dispatcher | Require exact target and one isolated stage'
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    install_stage: operator-audit
+    kubeconfig_path: ''
+    expected_api_server: ''
+    protected_api_server: ''
+  tasks:
+    - name: 'Require explicit cluster and supported single-stage operation'
+      ansible.builtin.assert:
+        that:
+          - install_stage in ['operator-audit', 'operator-bootstrap', 'installplan-audit', 'installplan-approve', 'operator-ready', 'fusion-audit', 'fusion-create', 'odf-audit']
+          - kubeconfig_path | length > 0
+          - kubeconfig_path != (lookup('env', 'HOME') ~ '/.kube/config')
+          - expected_api_server is match('^https://[^/]+:6443$')
+          - protected_api_server == '' or expected_api_server != protected_api_server
+          - scenario | default('live') in ['', 'live']
+          - not (install_data_foundation | default(false) | bool)
+          - not (approve_disk_claim | default(false) | bool)
+          - not (deploy | default(false) | bool)
+          - not (apply | default(false) | bool)
+          - not (install_operators | default(false) | bool)
+          - (operator_phase_apply | default(false) | bool) == (install_stage == 'operator-bootstrap')
+          - (approve_fusion_installplan | default(false) | bool) == (install_stage == 'installplan-approve')
+          - (initialize_fusion | default(false) | bool) == (install_stage == 'fusion-create')
+          - (accept_ibm_license | default(false) | bool) == (install_stage == 'fusion-create')
+          - install_stage not in ['operator-bootstrap', 'installplan-approve', 'fusion-create'] or protected_api_server | length > 0
+        fail_msg: 'BLOCKED - Wrong cluster or cross-stage flag. Each WRITE stage requires its matching approval and protected POC endpoint.'
+        success_msg: 'PASS - Isolated stage selected with explicit target. Internal safety gates still apply.'
+
+    - name: 'Confirm actual connected endpoint BEFORE any stage runs'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami, --show-server]
+      register: release_target
+      changed_when: false
+
+    - name: 'Require actual API to match configuration, never protected POC'
+      ansible.builtin.assert:
+        that:
+          - (release_target.stdout | trim) == (expected_api_server | trim)
+          - protected_api_server == '' or (release_target.stdout | trim) != (protected_api_server | trim)
+        fail_msg: 'BLOCKED - The supplied kubeconfig is NOT bound to the approved test cluster.'
+
+    - name: 'Display selected installer stage'
+      ansible.builtin.debug:
+        msg: 'Stage={{ install_stage }}; API={{ release_target.stdout | trim }}; write requested={{ install_stage in ["operator-bootstrap", "installplan-approve", "fusion-create"] }}'
+
+# Each imported playbook is an existing validated phase: one stage is executed at a time.
+# `when` is propagated to imported tasks by Ansible.
+- import_playbook: internal/prepare-fusion-operator-stage4l.yml
+  when: (install_stage | default('operator-audit')) in ['operator-audit', 'operator-bootstrap']
+
+- import_playbook: internal/review-fusion-installplan-stage4m.yml
+  when: (install_stage | default('operator-audit')) == 'installplan-audit'
+
+- import_playbook: internal/review-approve-fusion-installplan-stage4n.yml
+  when: (install_stage | default('operator-audit')) == 'installplan-approve'
+
+- import_playbook: internal/verify-fusion-operator-stage4o.yml
+  when: (install_stage | default('operator-audit')) == 'operator-ready'
+
+- import_playbook: internal/inspect-spectrumfusion-stage4p.yml
+  when: (install_stage | default('operator-audit')) == 'fusion-audit'
+
+- import_playbook: internal/initialize-spectrumfusion-stage4q.yml
+  when: (install_stage | default('operator-audit')) == 'fusion-create'
+
+- import_playbook: internal/inspect-data-foundation-stage4r.yml
+  when: (install_stage | default('operator-audit')) == 'odf-audit'

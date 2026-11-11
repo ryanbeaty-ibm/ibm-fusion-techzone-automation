@@ -1,0 +1,58 @@
+---
+# Phase 4V: Read-only target-cluster IBM entitlement verification.
+# No reference to prior labs; the image is pinned in the target config.
+- name: 'Phase 4V | Verify IBM entitled registry using the selected target cluster'
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    registry_probe_image: ''
+    kubeconfig_path: ''
+    expected_api_server: ''
+    protected_api_server: ''
+  tasks:
+    - name: '00 | Require target pin and explicitly supplied product image'
+      ansible.builtin.assert:
+        that:
+          - preflight_stage == 'registry'
+          - kubeconfig_path | length > 0
+          - expected_api_server | length > 0
+          - expected_api_server != protected_api_server
+          - registry_probe_image is match('^cp\.icr\.io/cp/.+@sha256:[0-9a-f]{64}$')
+        fail_msg: 'BLOCKED - Set registry_probe_image to an IBM-published, pinned ENTITLED image for the product, and pin the target API.'
+
+    - name: '01 | Inspect private IBM image manifest with target pull-secret credentials (no logs)'
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ lookup('first_found', [playbook_dir ~ '/../scripts/verify_ibm_registry.py', playbook_dir ~ '/../../scripts/verify_ibm_registry.py']) }}"
+          - --kubeconfig
+          - '{{ kubeconfig_path }}'
+          - --expected-api
+          - '{{ expected_api_server }}'
+          - --protected-api
+          - '{{ protected_api_server }}'
+          - --image
+          - '{{ registry_probe_image }}'
+      register: registry_probe_result
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: '02 | Report sanitized registry verification result'
+      ansible.builtin.debug:
+        msg:
+          - 'API={{ expected_api_server }}'
+          - 'Image={{ registry_probe_image }}'
+          - 'Manifest verification={{ "PASS" if registry_probe_result.rc == 0 else "FAIL" }}'
+          - 'Reason={{ (registry_probe_result.stdout | from_json).reason if registry_probe_result.stdout | trim | length > 0 else "PROBE_EXECUTION_FAILED" }}'
+          - 'No Kubernetes resources changed. No image layers downloaded.'
+
+    - name: '03 | Do not declare entitlement verified unless image manifest was readable'
+      ansible.builtin.assert:
+        that:
+          - registry_probe_result.rc == 0
+          - (registry_probe_result.stdout | from_json).verified | bool
+        fail_msg: 'BLOCKED - Target credentials could not read the configured entitled image. Never set registry_entitlement_verified=true without resolving this.'
+        success_msg: 'PASS - Target pull secret authenticated and read the configured IBM entitled image manifest.'

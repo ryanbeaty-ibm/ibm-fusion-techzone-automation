@@ -1,0 +1,190 @@
+---
+- name: IBM Fusion Lab 01 Scale Client v1.3 | Apply kernel-devel to dedicated Scale MCP (Lab 01 only)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    manifest_dir: "{{ playbook_dir }}/../build/scale-lab01"
+    mc_file: "{{ manifest_dir }}/00-scale-kernel-devel.yaml"
+    mc_name: 00-scale-ibm-spectrum-scale-kernel-devel
+    expected_scale_nodes:
+      - itz-s6fyum-worker-1
+      - itz-s6fyum-worker-2
+      - itz-s6fyum-worker-3
+    ceph_nodes:
+      - itz-s6fyum-infra-1
+      - itz-s6fyum-infra-2
+      - itz-s6fyum-infra-3
+  tasks:
+    - name: Require explicit permission and exact Lab 01 configuration
+      ansible.builtin.assert:
+        that:
+          - kubeconfig == '/home/automation/.kube/lab01.conf'
+          - scale_apply_enabled | default(false) | bool
+          - (scale_nodes | sort) == (expected_scale_nodes | sort)
+          - scale_node_label_key == 'demo.ibm.com/scale-client'
+          - scale_node_label_value == 'true'
+        fail_msg: 'Refusing to change cluster; use Lab 01 only and -e scale_apply_enabled=true.'
+
+    - name: Require generated kernel MachineConfig
+      ansible.builtin.stat:
+        path: '{{ mc_file }}'
+      register: mc_stat
+
+    - name: Verify file exists
+      ansible.builtin.assert:
+        that:
+          - mc_stat.stat.isreg | default(false)
+        fail_msg: 'Run playbooks/lab01-scale-nodeprep-render.yml first.'
+
+    - name: Read kernel MachineConfig manifest
+      ansible.builtin.slurp:
+        src: '{{ mc_file }}'
+      register: mc_raw
+
+    - name: Parse kernel MachineConfig manifest
+      ansible.builtin.set_fact:
+        mc_manifest: '{{ mc_raw.content | b64decode | from_yaml }}'
+
+    - name: Verify kernel extension is restricted to Scale pool
+      ansible.builtin.assert:
+        that:
+          - mc_manifest.kind == 'MachineConfig'
+          - mc_manifest.metadata.name == mc_name
+          - mc_manifest.metadata.labels['machineconfiguration.openshift.io/role'] == 'scale'
+          - (mc_manifest.spec.extensions | sort) == (['kernel-devel'] | sort)
+          - mc_manifest.spec.config.ignition.version == '3.2.0'
+        fail_msg: 'Unexpected kernel MachineConfig; refusing to apply.'
+
+    - name: Read current MachineConfigPools
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', get, mcp, -o, json]
+      register: mcp_json
+      changed_when: false
+
+    - name: Parse current pools
+      ansible.builtin.set_fact:
+        pools: "{{ (mcp_json.stdout | from_json)['items'] }}"
+        scale_pool: "{{ (mcp_json.stdout | from_json)['items'] | selectattr('metadata.name', 'equalto', 'scale') | first }}"
+        worker_pool: "{{ (mcp_json.stdout | from_json)['items'] | selectattr('metadata.name', 'equalto', 'worker') | first }}"
+
+    - name: Ensure Scale and Ceph pools are separate and stable
+      ansible.builtin.assert:
+        that:
+          - "scale_pool.spec.nodeSelector.matchLabels == {'node-role.kubernetes.io/scale': ''}"
+          - scale_pool.spec.machineConfigSelector.matchExpressions[0].key == 'machineconfiguration.openshift.io/role'
+          - scale_pool.spec.machineConfigSelector.matchExpressions[0].operator == 'In'
+          - (scale_pool.spec.machineConfigSelector.matchExpressions[0]['values'] | sort) == (['worker', 'scale'] | sort)
+          - scale_pool.status.machineCount | int == 3
+          - scale_pool.status.readyMachineCount | int == 3
+          - scale_pool.status.updatedMachineCount | int == 3
+          - scale_pool.status.degradedMachineCount | int == 0
+          - worker_pool.status.machineCount | int == 3
+          - worker_pool.status.readyMachineCount | int == 3
+          - worker_pool.status.updatedMachineCount | int == 3
+          - worker_pool.status.degradedMachineCount | int == 0
+        fail_msg: 'One of the node pools is not ready or correctly isolated. Stop and inspect.'
+
+    - name: Read OpenShift nodes
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', get, nodes, -o, json]
+      register: node_json
+      changed_when: false
+
+    - name: Parse node list
+      ansible.builtin.set_fact:
+        node_list: "{{ (node_json.stdout | from_json)['items'] }}"
+
+    - name: Gather nodes labeled with the Scale role
+      ansible.builtin.set_fact:
+        actual_scale_nodes: "{{ (actual_scale_nodes | default([])) + [item.metadata.name] }}"
+      loop: '{{ node_list }}'
+      loop_control:
+        label: '{{ item.metadata.name }}'
+      when: "'node-role.kubernetes.io/scale' in item.metadata.labels"
+
+    - name: Require exactly the selected three Scale workers
+      ansible.builtin.assert:
+        that:
+          - (actual_scale_nodes | default([]) | sort) == (expected_scale_nodes | sort)
+        fail_msg: 'Unexpected node labeled for the dedicated Scale pool.'
+
+    - name: Verify selected workers have the Scale role and are Ready
+      ansible.builtin.assert:
+        that:
+          - "'node-role.kubernetes.io/scale' in (node_list | selectattr('metadata.name', 'equalto', item) | first).metadata.labels"
+          - "'node-role.kubernetes.io/worker' in (node_list | selectattr('metadata.name', 'equalto', item) | first).metadata.labels"
+          - >-
+            ((node_list | selectattr('metadata.name', 'equalto', item) | first).status.conditions
+             | selectattr('type', 'equalto', 'Ready')
+             | map(attribute='status') | first) == 'True'
+        fail_msg: 'Selected Scale worker is not Ready or not correctly labeled.'
+      loop: '{{ expected_scale_nodes }}'
+      loop_control:
+        label: '{{ item }}'
+
+    - name: Confirm Ceph infrastructure nodes are NOT selected for Scale
+      ansible.builtin.assert:
+        that:
+          - "'node-role.kubernetes.io/scale' not in (node_list | selectattr('metadata.name', 'equalto', item) | first).metadata.labels"
+        fail_msg: 'Ceph node has Scale role; refusing to proceed.'
+      loop: '{{ ceph_nodes }}'
+      loop_control:
+        label: '{{ item }}'
+
+    - name: Confirm Ceph StorageCluster still exists
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', get, storageclusters.ocs.openshift.io, -n, openshift-storage, -o, json]
+      register: ceph_json
+      changed_when: false
+
+    - name: Assert Ceph StorageCluster exists
+      ansible.builtin.assert:
+        that:
+          - "((ceph_json.stdout | from_json)['items'] | length) == 1"
+
+    - name: Validate kernel MachineConfig against API server
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', apply, --dry-run=server, --validate=strict, -f, '{{ mc_file }}']
+      changed_when: false
+
+    - name: Apply kernel-devel to dedicated Scale pool only (rolling node reboots possible)
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', apply, -f, '{{ mc_file }}']
+      register: apply_mc
+      changed_when: "'created' in apply_mc.stdout or 'configured' in apply_mc.stdout"
+
+    - name: Show apply result
+      ansible.builtin.debug:
+        msg: '{{ apply_mc.stdout }}'
+
+    - name: Wait for Scale pool to reach kernel-devel configuration and all 3 nodes ready
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', get, mcp, scale, -o, json]
+      register: scale_status
+      changed_when: false
+      until: >-
+        (((scale_status.stdout | from_json).status.configuration.source | default([])
+           | selectattr('name', 'equalto', mc_name) | list | length) > 0)
+        and ((scale_status.stdout | from_json).status.machineCount | int == 3)
+        and ((scale_status.stdout | from_json).status.readyMachineCount | int == 3)
+        and ((scale_status.stdout | from_json).status.updatedMachineCount | int == 3)
+        and ((scale_status.stdout | from_json).status.degradedMachineCount | int == 0)
+        and (((scale_status.stdout | from_json).status.conditions
+              | selectattr('type', 'equalto', 'Updated')
+              | map(attribute='status') | first | default('False')) == 'True')
+      retries: 120
+      delay: 15
+
+    - name: Report final MachineConfigPools
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', get, mcp]
+      register: final_pools
+      changed_when: false
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - '{{ final_pools.stdout_lines }}'
+          - 'PHASE B COMPLETE: kernel-devel applied only to Scale worker pool.'
+          - 'Storage Scale Cluster/RemoteCluster/Filesystem/StorageClass NOT applied.'

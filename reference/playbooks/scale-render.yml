@@ -1,0 +1,35 @@
+---
+- name: IBM Fusion Scale v1.1 | Render candidate manifests locally, NO APPLY
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    manifest_dir: '{{ playbook_dir }}/../build/scale-v1.1'
+  tasks:
+    - name: Block accidental application from starter
+      ansible.builtin.assert:
+        that:
+          - not (scale_apply_enabled | bool)
+          - kubeconfig == '/home/automation/.kube/techzone-2.conf'
+        fail_msg: 'Starter supports inspection/render only; no cluster writes.'
+
+    - name: Create local manifest output directory
+      ansible.builtin.file:
+        path: '{{ manifest_dir }}'
+        state: directory
+        mode: '0700'
+
+    - name: Render candidate Kubernetes manifests
+      ansible.builtin.template:
+        src: '{{ playbook_dir }}/../templates/{{ item }}.j2'
+        dest: '{{ manifest_dir }}/{{ item }}'
+        mode: '0600'
+      loop:
+        - 01-cluster.yaml
+        - 02-remotecluster.yaml
+        - 03-filesystem.yaml
+        - 04-storageclass.yaml
+
+    - name: Show rendered file location
+      ansible.builtin.debug:
+        msg: 'Candidate manifests under {{ manifest_dir }} — NOT applied to OpenShift.'

@@ -1,0 +1,197 @@
+---
+- name: IBM Fusion Scale v1.1 | Phase C3 | Connect existing remote Scale storage cluster
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_prompt:
+    - name: scale_remote_gui_username
+      prompt: "Remote Scale GUI user (must have ContainerOperator privileges)"
+      default: csi-storage-gui-user
+      private: false
+    - name: scale_remote_gui_password
+      prompt: "Remote Scale GUI password (hidden; not written into files)"
+      private: true
+  vars:
+    scale_namespace: ibm-spectrum-scale
+    scale_cluster_name: ibm-spectrum-scale
+    scale_remote_manifest: "{{ playbook_dir }}/../build/scale-v1.1/02-remotecluster.yaml"
+    scale_remote_wait_retries: 180
+    scale_remote_wait_delay: 10
+
+  tasks:
+    - name: Require explicit approval for TechZone Lab 2 and three selected workers
+      ansible.builtin.assert:
+        that:
+          - kubeconfig == '/home/automation/.kube/techzone-2.conf'
+          - scale_apply_enabled | default(false) | bool
+          - (scale_nodes | sort) == (['itz-d4xrcs-worker-1', 'itz-d4xrcs-worker-2', 'itz-d4xrcs-worker-3'] | sort)
+          - scale_namespace == 'ibm-spectrum-scale'
+          - scale_name == 'techzone-scale-lab2'
+          - scale_management_host == '10.10.10.202'
+          - scale_filesystem == 'fs1'
+          - scale_gui_secret_name == 'techzone-scale-lab2-gui'
+        fail_msg: 'Phase C3 can only modify the approved remote connection in TechZone Lab 2.'
+
+    - name: Require a nonempty remote GUI username and password
+      ansible.builtin.assert:
+        that:
+          - (scale_remote_gui_username | length) > 0
+          - (scale_remote_gui_password | length) > 0
+        fail_msg: 'The remote GUI credentials cannot be blank.'
+      no_log: true
+
+    - name: Load the exact rendered RemoteCluster manifest (no other manifests)
+      ansible.builtin.set_fact:
+        desired_remote: "{{ lookup('ansible.builtin.file', scale_remote_manifest) | from_yaml }}"
+
+    - name: Verify the remote connection target and secret reference
+      ansible.builtin.assert:
+        that:
+          - desired_remote['apiVersion'] == 'scale.spectrum.ibm.com/v1beta1'
+          - desired_remote['kind'] == 'RemoteCluster'
+          - desired_remote['metadata']['namespace'] == scale_namespace
+          - desired_remote['metadata']['name'] == scale_name
+          - desired_remote['spec']['gui']['hosts'] == [scale_management_host]
+          - desired_remote['spec']['gui']['secretName'] == scale_gui_secret_name
+          - desired_remote['spec']['gui']['port'] | int == 443
+          - desired_remote['spec']['gui']['scheme'] == 'https'
+          - desired_remote['spec']['gui']['insecureSkipVerify'] | bool
+        fail_msg: 'RemoteCluster manifest differs from the approved Lab 2 target; not applying.'
+
+    - name: Inspect local Scale client Cluster health
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, '{{ scale_namespace }}', get, clusters.scale.spectrum.ibm.com, '{{ scale_cluster_name }}', -o, json]
+      register: client_cluster_raw
+      changed_when: false
+
+    - name: Require successful local Cluster setup before remote connection
+      ansible.builtin.assert:
+        that:
+          - >-
+            ((client_cluster_raw.stdout | from_json)['status']['conditions'] | default([])
+             | selectattr('type', 'equalto', 'Success')
+             | selectattr('status', 'equalto', 'True') | list | length) >= 1
+          - >-
+            (client_cluster_raw.stdout | from_json)['spec']['daemon']['nodeSelector'] == {'node-role.kubernetes.io/scale': ''}
+        fail_msg: 'Local Scale client Cluster must be configured and isolated before Phase C3.'
+
+    - name: Inspect Scale core pods
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, '{{ scale_namespace }}', get, pods, -l, 'app.kubernetes.io/name=core', -o, json]
+      register: cores_raw
+      changed_when: false
+
+    - name: Count Ready Scale core pods
+      ansible.builtin.shell: |
+        set -o pipefail
+        oc --kubeconfig='{{ kubeconfig }}' -n '{{ scale_namespace }}' \
+          get pods -l app.kubernetes.io/name=core -o json |
+          jq -r '"core=\(.items|length) ready=\([.items[] | select(any(.status.conditions[]?; .type=="Ready" and .status=="True"))]|length)"'
+      args:
+        executable: /bin/bash
+      register: ready_cores
+      changed_when: false
+
+    - name: Require exactly three Ready core pods on the selected application workers
+      ansible.builtin.assert:
+        that:
+          - ready_cores.stdout == 'core=3 ready=3'
+          - >-
+            ((cores_raw.stdout | from_json)['items'] | map(attribute='spec.nodeName') | sort | list) == (scale_nodes | sort)
+        fail_msg: 'Expected exactly three Ready Scale core pods on dedicated Scale worker nodes.'
+
+    - name: Confirm existing Ceph StorageCluster remains present
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, openshift-storage, get, storagecluster, -o, json]
+      register: ceph_raw
+      changed_when: false
+
+    - name: Refuse remote setup if existing Ceph StorageCluster is absent
+      ansible.builtin.assert:
+        that:
+          - ((ceph_raw.stdout | from_json)['items'] | length) >= 1
+
+    - name: Check existing RemoteCluster objects for conflicts
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, '{{ scale_namespace }}', get, remoteclusters.scale.spectrum.ibm.com, -o, json]
+      register: remotes_raw
+      changed_when: false
+
+    - name: Ensure there is no unrelated RemoteCluster configuration
+      ansible.builtin.assert:
+        that:
+          - >-
+            ((remotes_raw.stdout | from_json)['items'] | length) == 0 or
+            (((remotes_raw.stdout | from_json)['items'] | length) == 1 and
+             (remotes_raw.stdout | from_json)['items'][0]['metadata']['name'] == scale_name and
+             (remotes_raw.stdout | from_json)['items'][0]['spec']['gui']['hosts'] == [scale_management_host])
+        fail_msg: 'Unexpected existing RemoteCluster; review before changing remote storage access.'
+
+    - name: Construct Secret only in Ansible memory (never write plaintext to project)
+      ansible.builtin.set_fact:
+        scale_secret_payload:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ scale_gui_secret_name }}"
+            namespace: "{{ scale_namespace }}"
+            labels:
+              product: ibm-spectrum-scale
+          type: Opaque
+          data:
+            username: "{{ scale_remote_gui_username | b64encode }}"
+            password: "{{ scale_remote_gui_password | b64encode }}"
+      no_log: true
+
+    - name: Server-side apply GUI Secret using standard input (no command-line or last-applied-annotation password)
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, '{{ scale_namespace }}', apply, '--server-side', '--field-manager=fusion-automation', -f, '-']
+        stdin: "{{ scale_secret_payload | to_json }}"
+      register: secret_apply
+      changed_when: "' created' in secret_apply.stdout or ' configured' in secret_apply.stdout"
+      no_log: true
+
+    - name: Drop plaintext Secret payload from Ansible facts
+      ansible.builtin.set_fact:
+        scale_secret_payload: null
+      no_log: true
+
+    - name: Validate ONLY RemoteCluster against API server
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, '{{ scale_namespace }}', apply, '--dry-run=server', '--validate=strict', -f, '{{ scale_remote_manifest }}']
+      changed_when: false
+
+    - name: Apply ONLY RemoteCluster definition (no Filesystem or StorageClass)
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, '{{ scale_namespace }}', apply, -f, '{{ scale_remote_manifest }}']
+      register: remote_apply
+      changed_when: "' created' in remote_apply.stdout or ' configured' in remote_apply.stdout"
+
+    - name: Wait for remote authentication to report Ready=True (up to 30 minutes)
+      ansible.builtin.shell: |
+        set -o pipefail
+        oc --kubeconfig='{{ kubeconfig }}' -n '{{ scale_namespace }}' \
+          get remotecluster.scale.spectrum.ibm.com '{{ scale_name }}' -o json |
+          jq -r 'if any(.status.conditions[]?; .type=="Ready" and .status=="True") then "ready" else "waiting" end'
+      args:
+        executable: /bin/bash
+      register: remote_poll
+      until: remote_poll.rc == 0 and remote_poll.stdout == 'ready'
+      retries: '{{ scale_remote_wait_retries | int }}'
+      delay: '{{ scale_remote_wait_delay | int }}'
+      changed_when: false
+
+    - name: Show final remote connection status without secrets
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, '{{ scale_namespace }}', get, remotecluster.scale.spectrum.ibm.com, '{{ scale_name }}']
+      register: remote_final
+      changed_when: false
+
+    - name: Phase C3 summary
+      ansible.builtin.debug:
+        msg:
+          - 'PHASE C3 PASS: remote IBM Storage Scale cluster reports Ready=True.'
+          - "RemoteCluster: {{ scale_name }}; GUI: {{ scale_management_host }}"
+          - 'Existing remote filesystem fs1 has NOT been mounted yet; StorageClass has NOT been applied.'
+          - 'No Ceph StorageCluster changes requested.'
+          - "{{ remote_final.stdout }}"

@@ -1,0 +1,17 @@
+# DRAFT ONLY. Do not apply until 4.21 Fusion/ODF mode and MCO prerequisites are confirmed.
+apiVersion: scale.spectrum.ibm.com/v1beta1
+kind: Cluster
+metadata:
+  name: ibm-spectrum-scale
+  namespace: {{ scale_namespace }}
+spec:
+  license:
+    accept: true
+    license: {{ scale_license }}
+  daemon:
+    nodeSelector:
+      {{ scale_node_label_key }}: '{{ scale_node_label_value }}'
+    resources:
+      requests:
+        cpu: '2'
+        memory: 6Gi

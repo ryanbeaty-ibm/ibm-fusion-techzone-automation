@@ -1,0 +1,36 @@
+---
+- name: Lab 01 | Render and server-validate external Scale manifest (no apply)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    manifest_dir: '{{ playbook_dir }}/../build/scale-lab01'
+  tasks:
+    - name: Verify Lab 01 parameters
+      ansible.builtin.assert:
+        that:
+          - kubeconfig == '/home/automation/.kube/lab01.conf'
+          - scale_apply_enabled | bool
+          - scale_namespace == 'ibm-spectrum-scale'
+          - scale_management_host == '10.10.10.202'
+          - scale_name == 'lab01-external-scale'
+          - scale_filesystem == 'fs1'
+          - (scale_nodes | sort) == (['itz-s6fyum-worker-1', 'itz-s6fyum-worker-2', 'itz-s6fyum-worker-3'] | sort)
+    - name: Make build directory
+      ansible.builtin.file:
+        path: '{{ manifest_dir }}'
+        state: directory
+        mode: '0700'
+    - name: Render remote cluster and filesystem
+      ansible.builtin.template:
+        src: '{{ playbook_dir }}/../templates/{{ item.src }}'
+        dest: '{{ manifest_dir }}/{{ item.out }}'
+        mode: '0600'
+      loop:
+        - {src: 02-remotecluster-lab01.yaml.j2, out: 02-remotecluster.yaml}
+        - {src: 03-filesystem-lab01.yaml.j2, out: 03-filesystem.yaml}
+    - name: Server validate remote connection before applying
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', apply, '--dry-run=server', '--validate=strict', -f, '{{ manifest_dir }}/{{ item }}']
+      changed_when: false
+      loop: [02-remotecluster.yaml]

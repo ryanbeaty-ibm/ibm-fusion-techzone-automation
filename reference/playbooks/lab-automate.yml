@@ -1,0 +1,386 @@
+---
+# IBM Fusion Software 2.14.1 -- repeatable, single-run LAB Operator + SpectrumFusion deployment.
+# Intentionally never creates Data Foundation services, LocalVolumeSets, PVs, or StorageClusters.
+# One approval at the invocation boundary, not one approval per step.
+- name: 'LAB | Install IBM Fusion Operator and initialize SpectrumFusion'
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    kubeconfig_path: ''
+    expected_api_server: ''
+    protected_api_server: ''
+    expected_ocp_minor: '4.21'
+    expected_fusion_csv: isf-operator.v2.14.1
+    fusion_namespace: ibm-spectrum-fusion-ns
+    fusion_package: isf-operator
+    fusion_operator_group: isf-og
+    fusion_catalog: ibm-operator-catalog
+    fusion_channel: v2.0
+    fusion_cr_name: spectrumfusion
+    fusion_crd: spectrumfusions.prereq.isf.ibm.com
+    lab_apply: false
+    lab_accept_ibm_license: false
+    fusion_controller_deployments:
+      - isf-update-operator-controller-manager
+      - isf-serviceability-operator-controller-manager
+      - isf-data-protection-operator-controller-manager
+      - isf-ui-operator-controller-manager
+      - isf-platform-operator-controller-manager
+      - isf-prereq-operator-controller-manager
+      - isf-cns-operator-controller-manager
+      - isf-application-operator-controller-manager
+  tasks:
+    - name: '00 | Require explicit target and one-run authorization'
+      ansible.builtin.assert:
+        that:
+          - kubeconfig_path | length > 0
+          - kubeconfig_path != (lookup('env', 'HOME') ~ '/.kube/config')
+          - expected_api_server is match('^https://[^/]+:6443$')
+          - protected_api_server | length == 0 or expected_api_server != protected_api_server
+          - not (lab_apply | bool) or (lab_accept_ibm_license | bool)
+          - not (install_data_foundation | default(false) | bool)
+          - not (approve_disk_claim | default(false) | bool)
+          - not (deploy | default(false) | bool)
+          - not (apply | default(false) | bool)
+        fail_msg: 'BLOCKED: pass a pinned nondefault cluster; --lab_apply also needs lab_accept_ibm_license=true. No disk writes supported.'
+
+    - name: '00 | Check kubeconfig exists'
+      ansible.builtin.stat:
+        path: '{{ kubeconfig_path }}'
+      register: lab_kube
+
+    - name: '00 | Require a regular kubeconfig'
+      ansible.builtin.assert:
+        that: [lab_kube.stat.isreg | default(false)]
+
+    - name: '01 | Identify actual target cluster'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami, --show-server]
+      changed_when: false
+      register: lab_server
+
+    - name: '01 | Require exact API match and block protected cluster'
+      ansible.builtin.assert:
+        that:
+          - (lab_server.stdout | trim) == expected_api_server
+          - protected_api_server | length == 0 or (lab_server.stdout | trim) != protected_api_server
+        fail_msg: 'STOP: kubeconfig points to a different or protected OpenShift cluster.'
+
+    - name: '01 | Inspect OpenShift version'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, clusterversion, version, -o, 'jsonpath={.status.desired.version}']
+      changed_when: false
+      register: lab_ocp
+
+    - name: '01 | Confirm supported OpenShift version'
+      ansible.builtin.assert:
+        that:
+          - lab_ocp.stdout is match('^' ~ (expected_ocp_minor | regex_escape) ~ '[.]')
+        fail_msg: 'STOP: unexpected OpenShift version; review IBM Fusion support before proceeding.'
+
+    - name: '01 | Show target and mode'
+      ansible.builtin.debug:
+        msg: 'Target={{ lab_server.stdout }}; OCP={{ lab_ocp.stdout }}; apply={{ lab_apply | bool }}; protected POC is never queried.'
+
+    - name: '02 | Inspect all Fusion Operator CSVs'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, csv, -A, -o, json]
+      changed_when: false
+      register: lab_csv_all_raw
+
+    - name: '02 | Inspect Fusion OperatorGroups'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, operatorgroups, -A, -o, json]
+      changed_when: false
+      register: lab_ogs_raw
+
+    - name: '02 | Inspect Fusion Subscriptions'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, subscriptions, -A, -o, json]
+      changed_when: false
+      register: lab_subs_raw
+
+    - name: '02 | Inspect InstallPlans including orphaned plans'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, installplans, -A, -o, json]
+      changed_when: false
+      register: lab_plans_raw
+
+    - name: '02 | Inspect namespace'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, namespace, '{{ fusion_namespace }}', -o, json, --ignore-not-found]
+      changed_when: false
+      register: lab_ns_raw
+
+    - name: '02 | Select only this release''s resources'
+      ansible.builtin.set_fact:
+        lab_fusion_csvs: >-
+          {{ (lab_csv_all_raw.stdout | from_json)['items'] |
+             selectattr('metadata.name', 'match', '^isf-operator[.]') | list }}
+        lab_ogs: >-
+          {{ (lab_ogs_raw.stdout | from_json)['items'] |
+             selectattr('metadata.namespace', 'equalto', fusion_namespace) | list }}
+        lab_subs: >-
+          {{ (lab_subs_raw.stdout | from_json)['items'] |
+             selectattr('metadata.namespace', 'equalto', fusion_namespace) | list }}
+        lab_plans: >-
+          {{ (lab_plans_raw.stdout | from_json)['items'] |
+             selectattr('metadata.namespace', 'equalto', fusion_namespace) | list }}
+        lab_ns_exists: '{{ lab_ns_raw.stdout | trim | length > 0 }}'
+
+    - name: '02 | Reject conflicting existing Operator resources'
+      ansible.builtin.assert:
+        that:
+          - lab_fusion_csvs | length <= 1
+          - lab_fusion_csvs | length == 0 or (lab_fusion_csvs[0].metadata.name == expected_fusion_csv and lab_fusion_csvs[0].metadata.namespace == fusion_namespace)
+          - lab_ogs | length <= 1
+          - lab_ogs | length == 0 or (lab_ogs[0].metadata.name == fusion_operator_group and (lab_ogs[0].spec.targetNamespaces | default([])) == [fusion_namespace])
+          - lab_subs | length <= 1
+          - lab_subs | length == 0 or (lab_subs[0].metadata.name == fusion_package and lab_subs[0].spec.name == fusion_package and lab_subs[0].spec.installPlanApproval == 'Manual' and lab_subs[0].spec.source == fusion_catalog)
+          - lab_plans | length <= 1
+          - lab_plans | length == 0 or (lab_plans[0].spec.clusterServiceVersionNames | default([])) == [expected_fusion_csv]
+        fail_msg: 'STOP: conflicting Operator resources. Inspect before installing over a pre-existing deployment.'
+
+    - name: '02 | Determine if Operator is already installed'
+      ansible.builtin.set_fact:
+        lab_csv_succeeded: >-
+          {{ lab_fusion_csvs | length == 1 and
+             (lab_fusion_csvs[0].status.phase | default('')) == 'Succeeded' }}
+
+    - name: '03 | Verify catalog source for new installation'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, catalogsource, '{{ fusion_catalog }}', -n, openshift-marketplace, -o, json]
+      changed_when: false
+      when: not (lab_csv_succeeded | bool)
+
+    - name: '03 | Read target catalog package manifest'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, packagemanifest, '{{ fusion_package }}', -n, openshift-marketplace, -o, json]
+      changed_when: false
+      register: lab_package_raw
+      when: not (lab_csv_succeeded | bool)
+
+    - name: '03 | Verify exact expected catalog channel and release'
+      ansible.builtin.assert:
+        that:
+          - (lab_package_raw.stdout | from_json).status.catalogSource == fusion_catalog
+          - >-
+            ((lab_package_raw.stdout | from_json).status.channels |
+             selectattr('name', 'equalto', fusion_channel) |
+             map(attribute='currentCSV') | first | default('')) == expected_fusion_csv
+        fail_msg: 'STOP: IBM catalog release/channel does not match the pinned Fusion CSV.'
+      when: not (lab_csv_succeeded | bool)
+
+    - name: '04 | Create Fusion namespace when absent'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', create, -f, -]
+        stdin: |
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: {{ fusion_namespace }}
+      when:
+        - lab_apply | bool
+        - not (lab_csv_succeeded | bool)
+        - not (lab_ns_exists | bool)
+
+    - name: '04 | Create dedicated OperatorGroup when absent'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', create, -f, -]
+        stdin: |
+          apiVersion: operators.coreos.com/v1
+          kind: OperatorGroup
+          metadata:
+            name: {{ fusion_operator_group }}
+            namespace: {{ fusion_namespace }}
+          spec:
+            targetNamespaces:
+              - {{ fusion_namespace }}
+            upgradeStrategy: Default
+      when:
+        - lab_apply | bool
+        - not (lab_csv_succeeded | bool)
+        - lab_ogs | length == 0
+
+    - name: '04 | Create Manual Subscription only when no plan or Subscription exists'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', create, -f, -]
+        stdin: |
+          apiVersion: operators.coreos.com/v1alpha1
+          kind: Subscription
+          metadata:
+            name: {{ fusion_package }}
+            namespace: {{ fusion_namespace }}
+          spec:
+            channel: {{ fusion_channel }}
+            name: {{ fusion_package }}
+            source: {{ fusion_catalog }}
+            sourceNamespace: openshift-marketplace
+            installPlanApproval: Manual
+      when:
+        - lab_apply | bool
+        - not (lab_csv_succeeded | bool)
+        - lab_plans | length == 0
+        - lab_subs | length == 0
+
+    - name: '05 | Wait for OLM to produce a Fusion InstallPlan'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, installplans, -n, '{{ fusion_namespace }}', -o, json]
+      changed_when: false
+      register: lab_plan_wait
+      until: >-
+        ((lab_plan_wait.stdout | from_json)['items'] |
+         selectattr('spec.clusterServiceVersionNames', 'equalto', [expected_fusion_csv]) | list | length) == 1
+        and
+        (((((lab_plan_wait.stdout | from_json)['items'] |
+             selectattr('spec.clusterServiceVersionNames', 'equalto', [expected_fusion_csv]) |
+             list | first | default({})).status.bundleLookups | default([])) | length) == 1)
+      retries: 36
+      delay: 5
+      when:
+        - lab_apply | bool
+        - not (lab_csv_succeeded | bool)
+
+    - name: '05 | Select the exact matching InstallPlan'
+      ansible.builtin.set_fact:
+        lab_matching_plans: >-
+          {{ (lab_plan_wait.stdout | from_json)['items'] |
+             selectattr('spec.clusterServiceVersionNames', 'equalto', [expected_fusion_csv]) | list }}
+      when:
+        - lab_apply | bool
+        - not (lab_csv_succeeded | bool)
+
+    - name: '05 | Validate Manual InstallPlan, CSV, and IBM catalog'
+      ansible.builtin.assert:
+        that:
+          - lab_matching_plans | length == 1
+          - lab_matching_plans[0].metadata.uid | default('') | length > 0
+          - lab_matching_plans[0].spec.approval == 'Manual'
+          - lab_matching_plans[0].spec.approved is boolean
+          - lab_matching_plans[0].metadata.ownerReferences | default([]) | length == 1
+          - lab_matching_plans[0].metadata.ownerReferences[0].kind == 'Subscription'
+          - lab_matching_plans[0].metadata.ownerReferences[0].name == fusion_package
+          - >-
+            lab_matching_plans[0].status.bundleLookups | default([]) | length == 1
+          - lab_matching_plans[0].status.bundleLookups[0].catalogSourceRef.name == fusion_catalog
+          - lab_matching_plans[0].status.bundleLookups[0].catalogSourceRef.namespace == 'openshift-marketplace'
+          - lab_matching_plans[0].spec.approved | bool or lab_matching_plans[0].status.phase == 'RequiresApproval'
+        fail_msg: 'STOP: unexpected or ambiguous OLM InstallPlan. No automatic approval.'
+      when:
+        - lab_apply | bool
+        - not (lab_csv_succeeded | bool)
+
+    - name: '05 | Approve only the validated Manual InstallPlan (UID-checked atomic patch)'
+      ansible.builtin.command:
+        argv:
+          - oc
+          - '--kubeconfig={{ kubeconfig_path }}'
+          - patch
+          - installplan
+          - '{{ lab_matching_plans[0].metadata.name }}'
+          - -n
+          - '{{ fusion_namespace }}'
+          - --type=json
+          - -p
+          - >-
+            {{ [
+              {'op':'test','path':'/metadata/uid','value':lab_matching_plans[0].metadata.uid},
+              {'op':'test','path':'/spec/approval','value':'Manual'},
+              {'op':'test','path':'/spec/approved','value':false},
+              {'op':'test','path':'/spec/clusterServiceVersionNames/0','value':expected_fusion_csv},
+              {'op':'replace','path':'/spec/approved','value':true}
+            ] | to_json }}
+      when:
+        - lab_apply | bool
+        - not (lab_csv_succeeded | bool)
+        - not (lab_matching_plans[0].spec.approved | bool)
+
+    - name: '06 | Wait until IBM Fusion Operator CSV succeeds'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, csv, '{{ expected_fusion_csv }}', -n, '{{ fusion_namespace }}', -o, 'jsonpath={.status.phase}', --ignore-not-found]
+      register: lab_csv_wait
+      changed_when: false
+      until: (lab_csv_wait.stdout | trim) == 'Succeeded'
+      retries: 90
+      delay: 10
+      when: lab_apply | bool
+
+    - name: '06 | Ensure every Fusion Operator Deployment is available'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', rollout, status, 'deployment/{{ item }}', -n, '{{ fusion_namespace }}', --timeout=240s]
+      loop: '{{ fusion_controller_deployments }}'
+      loop_control:
+        label: '{{ item }}'
+      changed_when: false
+      when: lab_apply | bool
+
+    - name: '07 | Wait for SpectrumFusion CRD to become available'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', wait, '--for=condition=Established', 'crd/{{ fusion_crd }}', --timeout=180s]
+      changed_when: false
+      when: lab_apply | bool
+
+    - name: '07 | Read any existing SpectrumFusion instances'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, '{{ fusion_crd }}', -A, -o, json]
+      register: lab_cr_raw
+      changed_when: false
+      when: lab_apply | bool
+
+    - name: '07 | Reject any unexpected Fusion instance'
+      ansible.builtin.assert:
+        that:
+          - (lab_cr_raw.stdout | from_json)['items'] | length <= 1
+          - >-
+            ((lab_cr_raw.stdout | from_json)['items'] | length == 0) or
+            (((lab_cr_raw.stdout | from_json)['items'][0].metadata.namespace == fusion_namespace) and
+             ((lab_cr_raw.stdout | from_json)['items'][0].metadata.name == fusion_cr_name))
+        fail_msg: 'STOP: existing Fusion CR belongs to another namespace/name. No overwrite.'
+      when: lab_apply | bool
+
+    - name: '08 | Create initial SpectrumFusion CR only if absent'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', create, -f, -]
+        stdin: |
+          apiVersion: prereq.isf.ibm.com/v1
+          kind: SpectrumFusion
+          metadata:
+            name: {{ fusion_cr_name }}
+            namespace: {{ fusion_namespace }}
+          spec:
+            license:
+              accept: true
+            GlobalDataPlatform:
+              Enable: false
+      when:
+        - lab_apply | bool
+        - lab_accept_ibm_license | bool
+        - (lab_cr_raw.stdout | from_json)['items'] | length == 0
+
+    - name: '09 | Verify the SpectrumFusion CR configuration'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, '{{ fusion_crd }}', '{{ fusion_cr_name }}', -n, '{{ fusion_namespace }}', -o, json]
+      changed_when: false
+      register: lab_cr_verified_raw
+      when: lab_apply | bool
+
+    - name: '09 | Refuse unexpected license or Global Data Platform settings'
+      ansible.builtin.assert:
+        that:
+          - (lab_cr_verified_raw.stdout | from_json).spec.license.accept | bool
+          - not ((lab_cr_verified_raw.stdout | from_json).spec.GlobalDataPlatform.Enable | bool)
+        fail_msg: 'STOP: existing or new SpectrumFusion CR does not match requested configuration.'
+      when: lab_apply | bool
+
+    - name: '10 | Report outcome (no Ceph/disks touched)'
+      ansible.builtin.debug:
+        msg:
+          - 'Target={{ expected_api_server }}; Fusion={{ expected_fusion_csv }}'
+          - 'Mode={{ "APPLIED" if lab_apply | bool else "READ-ONLY CHECK" }}'
+          - >-
+            {{ 'Operator Succeeded, controller Deployments ready, SpectrumFusion CR created/preserved and verified'
+               if lab_apply | bool else
+               'Current state inspected; invoke with lab_apply=true and lab_accept_ibm_license=true to install' }}
+          - 'Data Foundation/ODF/Ceph and disk claims are NOT performed by this playbook.'

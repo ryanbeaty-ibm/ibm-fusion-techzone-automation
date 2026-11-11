@@ -1,0 +1,212 @@
+---
+- name: IBM Fusion Lab 01 Scale Client v1.3 | Enroll 3 nodes in dedicated Scale MCP (LAB 01 ONLY)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    manifest_dir: '{{ playbook_dir }}/../build/scale-lab01'
+    expected_scale_nodes:
+      - itz-s6fyum-worker-1
+      - itz-s6fyum-worker-2
+      - itz-s6fyum-worker-3
+  tasks:
+    - name: Require explicit activation for Lab 01 and exactly three workers
+      ansible.builtin.assert:
+        that:
+          - kubeconfig == '/home/automation/.kube/lab01.conf'
+          - scale_apply_enabled | default(false) | bool
+          - (scale_nodes | sort) == (expected_scale_nodes | sort)
+          - scale_node_label_key == 'demo.ibm.com/scale-client'
+          - scale_node_label_value == 'true'
+        fail_msg: 'Refusing to modify cluster. Requires Lab 01 and -e scale_apply_enabled=true.'
+
+    - name: Check rendered dedicated Scale MCP file exists
+      ansible.builtin.stat:
+        path: '{{ manifest_dir }}/00-scale-mcp.yaml'
+      register: scale_mcp_file
+
+    - name: Require MCP manifest
+      ansible.builtin.assert:
+        that: scale_mcp_file.stat.isreg | default(false)
+        fail_msg: 'First run lab01-scale-nodeprep-render.yml to generate 00-scale-mcp.yaml.'
+
+    - name: Read the generated MachineConfigPool manifest
+      ansible.builtin.slurp:
+        src: '{{ manifest_dir }}/00-scale-mcp.yaml'
+      register: generated_pool_file
+
+    - name: Parse generated MachineConfigPool
+      ansible.builtin.set_fact:
+        generated_pool: "{{ generated_pool_file.content | b64decode | from_yaml }}"
+
+    - name: Verify this manifest cannot select Ceph nodes
+      ansible.builtin.assert:
+        that:
+          - generated_pool.kind == 'MachineConfigPool'
+          - generated_pool.metadata.name == 'scale'
+          - "generated_pool.spec.nodeSelector.matchLabels == {'node-role.kubernetes.io/scale': ''}"
+          - generated_pool.spec.machineConfigSelector.matchExpressions | length == 1
+          - generated_pool.spec.machineConfigSelector.matchExpressions[0].key == 'machineconfiguration.openshift.io/role'
+          - generated_pool.spec.machineConfigSelector.matchExpressions[0].operator == 'In'
+          - (generated_pool.spec.machineConfigSelector.matchExpressions[0]["values"] | sort) == (['worker', 'scale'] | sort)
+
+    - name: Inspect existing nodes
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', get, nodes, -o, json]
+      register: node_data
+      changed_when: false
+
+    - name: Parse nodes
+      ansible.builtin.set_fact:
+        node_info: '{{ node_data.stdout | from_json }}'
+
+    - name: Require all three selected nodes to be ready workers
+      ansible.builtin.assert:
+        that:
+          - item in (node_info['items'] | map(attribute='metadata.name') | list)
+          - "'node-role.kubernetes.io/worker' in (node_info['items'] | selectattr('metadata.name', 'equalto', item) | first).metadata.labels"
+          - "((node_info['items'] | selectattr('metadata.name', 'equalto', item) | first).status.conditions | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | first) == 'True'"
+      loop: '{{ scale_nodes }}'
+
+    - name: Ensure no unselected node already has the scale role
+      ansible.builtin.assert:
+        that:
+          - "'node-role.kubernetes.io/scale' not in item.metadata.labels"
+        fail_msg: 'An unselected node is labeled scale; refusing to change the pool.'
+      loop: "{{ node_info['items'] }}"
+      loop_control:
+        label: '{{ item.metadata.name }}'
+      when: item.metadata.name not in scale_nodes
+
+    - name: Inspect current MachineConfigPools
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', get, mcp, -o, json]
+      register: pools_before
+      changed_when: false
+
+    - name: Extract pre-existing Scale MCP, if any
+      ansible.builtin.set_fact:
+        preexisting_scale_pools: "{{ (pools_before.stdout | from_json)['items'] | selectattr('metadata.name', 'equalto', 'scale') | list }}"
+
+    - name: Block overwriting a differently configured Scale MCP
+      ansible.builtin.assert:
+        that:
+          - preexisting_scale_pools[0].spec.nodeSelector == generated_pool.spec.nodeSelector
+          - preexisting_scale_pools[0].spec.machineConfigSelector == generated_pool.spec.machineConfigSelector
+        fail_msg: 'An existing scale MCP differs from the generated manifest. Do not overwrite it.'
+      when: preexisting_scale_pools | length > 0
+
+    - name: Require normal worker pool healthy before moving nodes
+      ansible.builtin.assert:
+        that:
+          - >-
+            ((pools_before.stdout | from_json)['items']
+             | selectattr('metadata.name','equalto','worker') | first).status.conditions
+             | selectattr('type','equalto','Updated') | map(attribute='status') | first == 'True'
+          - >-
+            ((pools_before.stdout | from_json)['items']
+             | selectattr('metadata.name','equalto','worker') | first).status.conditions
+             | selectattr('type','equalto','Degraded') | map(attribute='status') | first == 'False'
+
+    - name: Confirm Ceph StorageCluster exists before changing pool membership
+      ansible.builtin.command:
+        argv:
+          - oc
+          - '--kubeconfig={{ kubeconfig }}'
+          - get
+          - storageclusters.ocs.openshift.io
+          - -n
+          - openshift-storage
+          - -o
+          - json
+      register: ceph_before
+      changed_when: false
+
+    - name: Require one existing Ceph StorageCluster
+      ansible.builtin.assert:
+        that: (ceph_before.stdout | from_json)['items'] | length == 1
+        fail_msg: 'Expected exactly one Ceph StorageCluster; stopping.'
+
+    - name: Server-validate dedicated scale MCP again
+      ansible.builtin.command:
+        argv:
+          - oc
+          - '--kubeconfig={{ kubeconfig }}'
+          - apply
+          - --dry-run=server
+          - --validate=strict
+          - -f
+          - '{{ manifest_dir }}/00-scale-mcp.yaml'
+      changed_when: false
+
+    - name: Create dedicated Scale MachineConfigPool (no kernel extension yet)
+      ansible.builtin.command:
+        argv:
+          - oc
+          - '--kubeconfig={{ kubeconfig }}'
+          - apply
+          - -f
+          - '{{ manifest_dir }}/00-scale-mcp.yaml'
+      register: create_mcp
+      changed_when: "'created' in create_mcp.stdout or 'configured' in create_mcp.stdout"
+
+    - name: Check MCP configuration matches the intended safe selectors
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', get, mcp, scale, -o, json]
+      register: mcp_created
+      changed_when: false
+
+    - name: Require scale MCP select only the three labeled worker nodes
+      ansible.builtin.assert:
+        that:
+          - >-
+            (mcp_created.stdout | from_json).spec.nodeSelector.matchLabels
+            == {'node-role.kubernetes.io/scale': ''}
+          - >-
+            ((mcp_created.stdout | from_json).spec.machineConfigSelector.matchExpressions[0]["values"] | sort)
+            == (['worker', 'scale'] | sort)
+
+    - name: Label only the three Scale worker nodes (may trigger pool transition)
+      ansible.builtin.command:
+        argv:
+          - oc
+          - '--kubeconfig={{ kubeconfig }}'
+          - label
+          - node
+          - '{{ item }}'
+          - 'node-role.kubernetes.io/scale='
+          - '{{ scale_node_label_key }}={{ scale_node_label_value }}'
+          - --overwrite
+      register: labels_changed
+      changed_when: "'not labeled' not in labels_changed.stdout"
+      loop: '{{ scale_nodes }}'
+
+    - name: Wait for the scale pool to report 3 updated, ready nodes
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', get, mcp, scale, -o, json]
+      register: scale_pool_status
+      changed_when: false
+      until: >-
+        ((scale_pool_status.stdout | from_json).status.machineCount | default(0) | int) == 3
+        and ((scale_pool_status.stdout | from_json).status.readyMachineCount | default(0) | int) == 3
+        and ((scale_pool_status.stdout | from_json).status.updatedMachineCount | default(0) | int) == 3
+        and ((scale_pool_status.stdout | from_json).status.degradedMachineCount | default(0) | int) == 0
+        and (((scale_pool_status.stdout | from_json).status.conditions
+              | selectattr('type', 'equalto', 'Updated')
+              | map(attribute='status') | first | default('False')) == 'True')
+      retries: 120
+      delay: 15
+
+    - name: Verify worker pool, scale pool, and all nodes after transition
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', get, mcp]
+      register: final_mcp
+      changed_when: false
+
+    - name: Show resulting MachineConfigPools
+      ansible.builtin.debug:
+        msg:
+          - '{{ final_mcp.stdout_lines }}'
+          - 'PHASE A COMPLETE: Scale custom pool and labels only.'
+          - 'No kernel-devel MachineConfig or Storage Scale Cluster was applied.'
+          - 'Inspect pool status before starting phase B (kernel-devel and expected worker reboots).'

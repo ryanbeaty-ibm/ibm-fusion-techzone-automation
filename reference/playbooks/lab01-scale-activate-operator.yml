@@ -1,0 +1,116 @@
+---
+- name: IBM Fusion Lab 01 Scale Client v1.3 | Phase C1 | Activate installed Scale operator only
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    scale_csv: ibm-spectrum-scale-operator.v60.1.0
+    scale_operator_deployment: ibm-spectrum-scale-controller-manager
+    scale_namespace: ibm-spectrum-scale
+  tasks:
+    - name: Require explicit activation for Lab 01 only
+      ansible.builtin.assert:
+        that:
+          - kubeconfig == '/home/automation/.kube/lab01.conf'
+          - scale_apply_enabled | default(false) | bool
+          - (scale_nodes | sort) == (['itz-s6fyum-worker-1', 'itz-s6fyum-worker-2', 'itz-s6fyum-worker-3'] | sort)
+        fail_msg: 'Refusing activation without Lab 01 config, expected nodes, and explicit opt-in.'
+
+    - name: Inspect the isolated Scale MachineConfigPool
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', get, mcp, scale, -o, json]
+      register: scale_mcp_raw
+      changed_when: false
+
+    - name: Parse Scale MachineConfigPool
+      ansible.builtin.set_fact:
+        scale_mcp: "{{ scale_mcp_raw.stdout | from_json }}"
+
+    - name: Require three updated Scale nodes and no degradation
+      ansible.builtin.assert:
+        that:
+          - (scale_mcp['status']['machineCount'] | int) == 3
+          - (scale_mcp['status']['readyMachineCount'] | int) == 3
+          - (scale_mcp['status']['updatedMachineCount'] | int) == 3
+          - (scale_mcp['status']['degradedMachineCount'] | int) == 0
+          - (scale_mcp['status']['conditions'] | selectattr('type', 'equalto', 'Updated') | map(attribute='status') | first) == 'True'
+          - (scale_mcp['status']['conditions'] | selectattr('type', 'equalto', 'Degraded') | map(attribute='status') | first) == 'False'
+
+    - name: Confirm existing Ceph storage remains present
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, openshift-storage, get, storagecluster, -o, json]
+      register: ceph_storage_raw
+      changed_when: false
+
+    - name: Require at least one existing Ceph StorageCluster
+      ansible.builtin.assert:
+        that:
+          - ((ceph_storage_raw.stdout | from_json)['items'] | length) >= 1
+
+    - name: Read installed Scale operator ClusterServiceVersion
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, '{{ scale_namespace }}', get, csv, '{{ scale_csv }}', -o, json]
+      register: csv_raw
+      changed_when: false
+
+    - name: Parse ClusterServiceVersion
+      ansible.builtin.set_fact:
+        csv_object: "{{ csv_raw.stdout | from_json }}"
+
+    - name: Confirm the expected Scale operator and healthy OLM installation
+      ansible.builtin.assert:
+        that:
+          - csv_object['status']['phase'] == 'Succeeded'
+          - (csv_object['spec']['install']['spec']['deployments'] | length) == 1
+          - csv_object['spec']['install']['spec']['deployments'][0]['name'] == scale_operator_deployment
+          - (csv_object['spec']['install']['spec']['deployments'][0]['spec']['replicas'] | int) in [0, 1]
+        fail_msg: 'Unexpected operator installation state: inspect the CSV before activating.'
+
+    - name: Record currently configured operator replicas
+      ansible.builtin.set_fact:
+        configured_replicas: "{{ csv_object['spec']['install']['spec']['deployments'][0]['spec']['replicas'] | int }}"
+
+    - name: Enable operator through its OLM-owned CSV (no Scale data resources created)
+      ansible.builtin.command:
+        argv:
+          - oc
+          - '--kubeconfig={{ kubeconfig }}'
+          - -n
+          - '{{ scale_namespace }}'
+          - patch
+          - csv
+          - '{{ scale_csv }}'
+          - --type=json
+          - '-p=[{"op":"replace","path":"/spec/install/spec/deployments/0/spec/replicas","value":1}]'
+      when: (configured_replicas | int) == 0
+
+    - name: Wait for the Scale operator deployment to become available
+      ansible.builtin.command:
+        argv:
+          - oc
+          - '--kubeconfig={{ kubeconfig }}'
+          - -n
+          - '{{ scale_namespace }}'
+          - rollout
+          - status
+          - 'deployment/{{ scale_operator_deployment }}'
+          - --timeout=900s
+      changed_when: false
+
+    - name: Inspect operator deployment after activation
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, '{{ scale_namespace }}', get, deploy, '{{ scale_operator_deployment }}', -o, json]
+      register: operator_deployment_raw
+      changed_when: false
+
+    - name: Assert at least one Scale operator replica is ready
+      ansible.builtin.assert:
+        that:
+          - (((operator_deployment_raw.stdout | from_json)['status']['readyReplicas'] | default(0)) | int) >= 1
+
+    - name: Summarize activation
+      ansible.builtin.debug:
+        msg:
+          - 'PHASE C1 COMPLETE: IBM Storage Scale Operator is running.'
+          - 'No Scale Cluster, RemoteCluster, Filesystem, StorageClass or Secrets were created.'
+          - 'Existing Ceph StorageCluster was not modified.'

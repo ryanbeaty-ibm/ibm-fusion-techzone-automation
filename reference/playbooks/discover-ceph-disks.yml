@@ -1,0 +1,86 @@
+---
+# IBM Storage Fusion - Phase 4B
+# Read-only disk discovery assessment. NEVER claims, formats, wipes, or provisions devices.
+# A reported CANDIDATE is NOT approval to use a device.
+- name: Phase 4B - Read-only local disk candidate assessment
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    min_disk_size_gib: 499
+    bytes_per_gib: 1073741824
+  tasks:
+    - name: "01 | Confirm OpenShift authentication"
+      ansible.builtin.command:
+        argv: [oc, whoami]
+      register: identity
+      changed_when: false
+
+    - name: "02 | Read OpenShift LocalVolumeDiscoveryResult inventory"
+      ansible.builtin.command:
+        argv: [oc, get, localvolumediscoveryresults, --all-namespaces, -o, json]
+      register: discovery_command
+      changed_when: false
+
+    - name: "03 | Parse device inventory"
+      ansible.builtin.set_fact:
+        discovery_data: "{{ discovery_command.stdout | from_json }}"
+
+    - name: "04 | Require discovery results"
+      ansible.builtin.assert:
+        that:
+          - "(discovery_data['items'] | length) > 0"
+        fail_msg: "No LocalVolumeDiscoveryResults exist. Disk selection cannot proceed."
+        success_msg: "Found discovery results for {{ discovery_data['items'] | length }} node(s)."
+
+    - name: "05 | Evaluate each non-zero-size disk without modifying it"
+      ansible.builtin.set_fact:
+        disk_report_json: |-
+          {% set ns = namespace(rows=[]) %}
+          {% for result in discovery_data['items'] %}
+          {% set node_name = result.get('spec', {}).get('nodeName', 'UNKNOWN') %}
+          {% for dev in result.get('status', {}).get('discoveredDevices', []) %}
+          {% set size_bytes = dev.get('size', 0) | int %}
+          {% if dev.get('type', '') == 'disk' and size_bytes > 0 %}
+          {% set path = dev.get('path', '') %}
+          {% set state = dev.get('status', {}).get('state', 'Unknown') %}
+          {% set fs = dev.get('fstype', '') %}
+          {% set media = dev.get('property', '') %}
+          {% if state != 'Available' %}
+          {% set verdict = 'EXCLUDE - device is in use or unavailable' %}
+          {% elif fs | length > 0 %}
+          {% set verdict = 'EXCLUDE - existing filesystem or signature' %}
+          {% elif size_bytes < ((min_disk_size_gib | int) * (bytes_per_gib | int)) %}
+          {% set verdict = 'EXCLUDE - below minimum capacity' %}
+          {% elif media != 'NonRotational' %}
+          {% set verdict = 'EXCLUDE - does not match required SSD media' %}
+          {% elif path is not match('^/dev/(?!nbd|rbd|loop|ram|zram)[A-Za-z0-9_-]+$') %}
+          {% set verdict = 'EXCLUDE - unsupported device path' %}
+          {% else %}
+          {% set verdict = 'CANDIDATE - requires manual verification and approval' %}
+          {% endif %}
+          {% set ns.rows = ns.rows + [{'node': node_name, 'path': path, 'size_gib': ((size_bytes / (bytes_per_gib | int)) | round(1)), 'state': state, 'fstype': fs, 'verdict': verdict}] %}
+          {% endif %}
+          {% endfor %}
+          {% endfor %}
+          {{ ns.rows | to_json }}
+
+    - name: "06 | Parse disk assessment"
+      ansible.builtin.set_fact:
+        disk_report: "{{ disk_report_json | from_json }}"
+
+    - name: "07 | Show non-zero-size disks and assessment"
+      ansible.builtin.debug:
+        msg: "{{ item.node }} {{ item.path }} | {{ item.size_gib }} GiB | {{ item.state }} | {{ item.verdict }}"
+      loop: "{{ disk_report }}"
+      loop_control:
+        label: "{{ item.node }} {{ item.path }}"
+
+    - name: "08 | Summarize candidates"
+      ansible.builtin.debug:
+        msg: >-
+          READ-ONLY disk assessment complete. Examined {{ disk_report | length }} non-zero-size
+          disks across {{ discovery_data['items'] | length }} discovery results.
+          Candidate count: {{ disk_report | selectattr('verdict', 'match', '^CANDIDATE') | list | length }}.
+          Candidates have NOT been verified as safe for use. No changes were made.

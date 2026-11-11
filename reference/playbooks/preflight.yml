@@ -1,0 +1,37 @@
+---
+# Consolidated entry point 1/3. Ansible fresh-cluster preflight; NO WRITES.
+# Requires kubeconfig_path and expected_api_server via -e @config/local/<name>.yml.
+- name: 'Preflight | Protect target selection and forbid writes'
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    kubeconfig_path: ''
+    expected_api_server: ''
+    protected_api_server: ''
+    preflight_stage: cluster
+  tasks:
+    - name: 'Require explicitly pinned alternate cluster'
+      ansible.builtin.assert:
+        that:
+          - preflight_stage in ['cluster', 'registry']
+          - kubeconfig_path | length > 0
+          - kubeconfig_path != (lookup('env', 'HOME') ~ '/.kube/config')
+          - expected_api_server is match('^https://[^/]+:6443$')
+          - protected_api_server == '' or expected_api_server != protected_api_server
+          - not (operator_phase_apply | default(false) | bool)
+          - not (approve_fusion_installplan | default(false) | bool)
+          - not (approve_techzone_orphan_installplan | default(false) | bool)
+          - not (initialize_fusion | default(false) | bool)
+          - not (accept_ibm_license | default(false) | bool)
+          - not (install_data_foundation | default(false) | bool)
+          - not (approve_disk_claim | default(false) | bool)
+        fail_msg: 'BLOCKED - A specific alternate kubeconfig/API pin is required, with no write flags.'
+        success_msg: 'PASS - Explicit fresh-cluster target; preflight is read-only.'
+
+- import_playbook: internal/preflight-fresh-cluster-stage4t.yml
+  when: (preflight_stage | default('cluster')) == 'cluster'
+
+- import_playbook: internal/registry-probe-stage4v.yml
+  when: (preflight_stage | default('cluster')) == 'registry'

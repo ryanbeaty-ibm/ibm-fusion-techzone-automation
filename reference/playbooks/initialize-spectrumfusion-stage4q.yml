@@ -1,0 +1,278 @@
+---
+# Phase 4Q — controlled IBM Fusion SpectrumFusion CR creation.
+# DEFAULT = READ-ONLY. Creation requires multiple explicit, independent pins and approvals.
+# NEVER patches, overwrites, deletes, or updates existing SpectrumFusion resources.
+# License acceptance is a legal/commercial action: execute ONLY with account-owner authorization.
+- name: 'Phase 4Q | Controlled SpectrumFusion initialization (default read-only)'
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    scenario: live
+    kubeconfig_path: "{{ lookup('env', 'HOME') }}/.kube/config"
+    expected_api_server: ''
+    protected_api_server: ''
+    fusion_namespace: ibm-spectrum-fusion-ns
+    fusion_cr_name: spectrumfusion
+    fusion_crd_name: spectrumfusions.prereq.isf.ibm.com
+    expected_fusion_csv: isf-operator.v2.14.1
+    initialize_fusion: false
+    accept_ibm_license: false
+    authorization_phrase: ''
+    q_manifest:
+      apiVersion: prereq.isf.ibm.com/v1
+      kind: SpectrumFusion
+      metadata:
+        name: "{{ fusion_cr_name }}"
+        namespace: "{{ fusion_namespace }}"
+      spec:
+        license:
+          accept: true
+        GlobalDataPlatform:
+          Enable: false
+  tasks:
+    - name: '00 | Reject invalid simulation modes and unrelated deployment flags'
+      ansible.builtin.assert:
+        that:
+          - scenario in ['live', 'empty', 'operator_ready', 'initialized']
+          - not (operator_phase_apply | default(false) | bool)
+          - not (approve_fusion_installplan | default(false) | bool)
+          - not (install_data_foundation | default(false) | bool)
+          - not (approve_disk_claim | default(false) | bool)
+          - not (deploy | default(false) | bool)
+          - not (apply | default(false) | bool)
+          - scenario == 'live' or not (initialize_fusion | bool)
+          - scenario == 'live' or not (accept_ibm_license | bool)
+          - not (accept_ibm_license | bool) or (initialize_fusion | bool)
+        success_msg: 'PASS - Only isolated SpectrumFusion initialization is supported'
+        fail_msg: 'BLOCKED - Invalid flags or write requested during simulation.'
+
+    - name: '01 | Simulate initialization decision without any OpenShift calls'
+      ansible.builtin.debug:
+        msg:
+          - 'OFFLINE SIMULATION - {{ scenario }}; no API calls or writes'
+          - >-
+              {{ 'Install IBM Fusion Operator first, then check 4O and 4P'
+                 if scenario == 'empty' else
+                 'Operator ready: independently authorize license and create one SpectrumFusion CR'
+                 if scenario == 'operator_ready' else
+                 'Already initialized: no create or modification required' }}
+          - 'Target manifest accepts license and disables GlobalDataPlatform; NEVER applied by simulation'
+      when: scenario != 'live'
+
+    - name: '02 | Live inventory and safe initialization controls'
+      when: scenario == 'live'
+      block:
+        - name: '02 | Verify kubeconfig file'
+          ansible.builtin.stat:
+            path: '{{ kubeconfig_path }}'
+          register: q_kube
+
+        - name: '02 | Refuse missing or non-regular kubeconfig'
+          ansible.builtin.assert:
+            that:
+              - q_kube.stat.exists | default(false)
+              - q_kube.stat.isreg | default(false)
+            fail_msg: 'BLOCKED - Kubeconfig missing or invalid.'
+
+        - name: '02 | Resolve exact API server'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami, --show-server]
+          register: q_server
+          changed_when: false
+
+        - name: '02 | Resolve current user identity'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami]
+          register: q_user
+          changed_when: false
+
+        - name: '02 | Enforce read-only pin if supplied and require pin for alternate kubeconfig'
+          ansible.builtin.assert:
+            that:
+              - >-
+                expected_api_server | length > 0 or
+                kubeconfig_path == (lookup('env', 'HOME') ~ '/.kube/config')
+              - >-
+                expected_api_server | length == 0 or
+                (q_server.stdout | trim) == (expected_api_server | trim)
+            fail_msg: 'BLOCKED - Missing or mismatched target OpenShift API pin.'
+
+        - name: '03 | Read expected Fusion Operator CSVs'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, csv, -A, -o, json]
+          register: q_csv_json
+          changed_when: false
+
+        - name: '03 | Read SpectrumFusion CRD if installed'
+          ansible.builtin.command:
+            argv:
+              - oc
+              - '--kubeconfig={{ kubeconfig_path }}'
+              - get
+              - crd
+              - '{{ fusion_crd_name }}'
+              - -o
+              - json
+              - --ignore-not-found
+          register: q_crd_json
+          changed_when: false
+
+        - name: '03 | Match Operator and CRD readiness'
+          ansible.builtin.set_fact:
+            q_matching_csvs: >-
+              {{ (q_csv_json.stdout | from_json)['items'] |
+                 selectattr('metadata.namespace', 'equalto', fusion_namespace) |
+                 selectattr('metadata.name', 'equalto', expected_fusion_csv) | list }}
+            q_crd_exists: '{{ q_crd_json.stdout | trim | length > 0 }}'
+
+        - name: '03 | Check Operator CSV uniqueness'
+          ansible.builtin.assert:
+            that:
+              - q_matching_csvs | length <= 1
+            fail_msg: 'BLOCKED - Ambiguous matching Fusion Operator CSVs.'
+
+        - name: '03 | Check CRD serves v1'
+          ansible.builtin.set_fact:
+            q_operator_ready: >-
+              {{ q_matching_csvs | length == 1 and
+                 (q_matching_csvs[0].status.phase | default('')) == 'Succeeded' }}
+            q_crd_v1_served: >-
+              {{ ((q_crd_json.stdout | from_json).spec.versions | default([]) |
+                  selectattr('name', 'equalto', 'v1') |
+                  selectattr('served', 'equalto', true) | list | length) == 1
+                 if q_crd_exists | bool else false }}
+
+        - name: '04 | List SpectrumFusion CRs across all namespaces if API exists'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, '{{ fusion_crd_name }}', -A, -o, json]
+          register: q_fusion_json
+          changed_when: false
+          when: q_crd_v1_served | bool
+
+        - name: '04 | Extract existing CR inventory'
+          ansible.builtin.set_fact:
+            q_existing_crs: >-
+              {{ ((q_fusion_json.stdout | from_json)['items'])
+                 if q_crd_v1_served | bool else [] }}
+
+        - name: '04 | Show READ-ONLY installation and authorization status'
+          ansible.builtin.debug:
+            msg:
+              - 'Mode={{ "WRITE REQUESTED - approval checks required" if initialize_fusion | bool else "READ ONLY" }}'
+              - 'API={{ q_server.stdout | trim }}; identity={{ q_user.stdout | trim }}'
+              - 'Kubeconfig={{ kubeconfig_path }}; API pin supplied={{ expected_api_server | length > 0 }}'
+              - 'Expected CSV={{ expected_fusion_csv }}; Succeeded={{ q_operator_ready | bool }}'
+              - 'SpectrumFusion v1 available={{ q_crd_v1_served | bool }}'
+              - 'Existing SpectrumFusion CRs={{ q_existing_crs | length }}'
+              - 'Target CR namespace/name={{ fusion_namespace }}/{{ fusion_cr_name }}'
+              - 'Proposed license.accept=true; GlobalDataPlatform.Enable=false'
+              - >-
+                  STATE={{ 'ALREADY_EXISTS - NO OVERWRITE' if q_existing_crs | length > 0 else
+                  'OPERATOR_NOT_READY' if not q_operator_ready | bool else
+                  'CRD_NOT_READY' if not q_crd_v1_served | bool else
+                  'READY_FOR_INDEPENDENT_LICENSE_AUTHORIZATION' }}
+              - 'No Data Foundation, LocalVolumeSet, or disk operations are included.'
+
+        - name: '05 | Require explicit independent approvals and separate fresh-cluster target before creating CR'
+          ansible.builtin.assert:
+            that:
+              - accept_ibm_license | bool
+              - authorization_phrase == 'I_AUTHORIZE_IBM_FUSION_LICENSE_ACCEPTANCE'
+              - expected_api_server | length > 0
+              - protected_api_server | length > 0
+              - (q_server.stdout | trim) == (expected_api_server | trim)
+              - (q_server.stdout | trim) != (protected_api_server | trim)
+              - kubeconfig_path != (lookup('env', 'HOME') ~ '/.kube/config')
+              - q_operator_ready | bool
+              - q_crd_v1_served | bool
+              - q_existing_crs | length == 0
+              - fusion_namespace == 'ibm-spectrum-fusion-ns'
+              - fusion_cr_name == 'spectrumfusion'
+              - expected_fusion_csv == 'isf-operator.v2.14.1'
+            fail_msg: 'BLOCKED - Missing approvals, existing CR, wrong API, or Operator/CRD not ready.'
+            success_msg: 'PASS - Explicit license authorization, target pins, Operator and no-existing-CR checks satisfied'
+          when: initialize_fusion | bool
+
+        - name: '06 | Check CREATE privilege for SpectrumFusion CR'
+          ansible.builtin.command:
+            argv:
+              - oc
+              - '--kubeconfig={{ kubeconfig_path }}'
+              - auth
+              - can-i
+              - create
+              - '{{ fusion_crd_name }}'
+              - -n
+              - '{{ fusion_namespace }}'
+          register: q_can_create
+          changed_when: false
+          when: initialize_fusion | bool
+
+        - name: '06 | Require authorization to create CR'
+          ansible.builtin.assert:
+            that:
+              - q_can_create.stdout | trim == 'yes'
+            fail_msg: 'BLOCKED - No permission to create SpectrumFusion CR.'
+          when: initialize_fusion | bool
+
+        - name: '07 | Re-read existing SpectrumFusion CRs immediately before creation'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, '{{ fusion_crd_name }}', -A, -o, json]
+          register: q_fusion_recheck
+          changed_when: false
+          when: initialize_fusion | bool
+
+        - name: '07 | Refuse creation if any CR appeared since review'
+          ansible.builtin.assert:
+            that:
+              - (q_fusion_recheck.stdout | from_json)['items'] | length == 0
+            fail_msg: 'BLOCKED - SpectrumFusion already exists or inventory changed.'
+          when: initialize_fusion | bool
+
+        - name: '08 | CREATE one SpectrumFusion CR (no apply/update/overwrite)'
+          ansible.builtin.command:
+            argv:
+              - oc
+              - '--kubeconfig={{ kubeconfig_path }}'
+              - create
+              - -f
+              - '-'
+            stdin: '{{ q_manifest | to_nice_yaml(indent=2) }}'
+          register: q_created
+          when: initialize_fusion | bool
+          # command is intentionally NOT set to changed_when=false: this is a real write.
+
+        - name: '09 | Read created CR after authorized creation'
+          ansible.builtin.command:
+            argv:
+              - oc
+              - '--kubeconfig={{ kubeconfig_path }}'
+              - get
+              - '{{ fusion_crd_name }}'
+              - '{{ fusion_cr_name }}'
+              - -n
+              - '{{ fusion_namespace }}'
+              - -o
+              - json
+          register: q_created_json
+          changed_when: false
+          when: initialize_fusion | bool
+
+        - name: '09 | Require license accepted and GDP disabled after creation'
+          ansible.builtin.assert:
+            that:
+              - (q_created_json.stdout | from_json).spec.license.accept | bool
+              - not ((q_created_json.stdout | from_json).spec.GlobalDataPlatform.Enable | bool)
+            fail_msg: 'STOP - New SpectrumFusion CR does not match intended configuration.'
+          when: initialize_fusion | bool
+
+    - name: '99 | Finish isolated Phase 4Q stage'
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'PASS - Phase 4Q simulation finished (no cluster interaction)'
+             if scenario != 'live' else
+             'PASS - Phase 4Q read-only audit finished (no cluster changes)'
+             if not initialize_fusion | bool else
+             'Phase 4Q CR creation attempted with explicit authorization; confirm post-create health separately' }}

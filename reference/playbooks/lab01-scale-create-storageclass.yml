@@ -1,0 +1,159 @@
+---
+- name: Lab 01 | Safely create or repair verified Scale StorageClass fusionfs1
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    manifest_dir: '{{ playbook_dir }}/../build/scale-lab01'
+    local_fs_name: '{{ scale_name }}-{{ scale_filesystem }}'
+    legacy_bad_backend: '{{ scale_filesystem }}-{{ scale_cluster_id }}'
+  tasks:
+    - name: Require live remote cluster ID and approved Lab 01
+      ansible.builtin.assert:
+        that:
+          - kubeconfig == '/home/automation/.kube/lab01.conf'
+          - scale_apply_enabled | bool
+          - scale_storageclass == 'fusionfs1'
+          - scale_name == 'lab01-external-scale'
+          - scale_filesystem == 'fs1'
+          - scale_cluster_id is defined
+          - scale_cluster_id is match('^[0-9]{12,22}$')
+        fail_msg: 'Invalid live cluster ID or Lab 01 parameters. Refusing to change StorageClass.'
+
+    - name: Check actual connected API
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', whoami, --show-server]
+      register: actual_api
+      changed_when: false
+
+    - name: Require exact Lab 01 cluster
+      ansible.builtin.assert:
+        that:
+          - actual_api.stdout == 'https://api.itz-s6fyum.infra01-lb.wdc04.techzone.ibm.com:6443'
+
+    - name: Inspect the mounted local Scale Filesystem
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, ibm-spectrum-scale, get, filesystem.scale.spectrum.ibm.com, '{{ local_fs_name }}', -o, json]
+      register: mounted_fs
+      changed_when: false
+
+    - name: Require the correct external fs1 mount in Ready state
+      ansible.builtin.assert:
+        that:
+          - (mounted_fs.stdout | from_json)['spec']['remote']['cluster'] == scale_name
+          - (mounted_fs.stdout | from_json)['spec']['remote']['fs'] == scale_filesystem
+          - >-
+            ((mounted_fs.stdout | from_json)['status']['conditions'] | default([]) |
+             selectattr('type','equalto','Success') | selectattr('status','equalto','True') | list | length) >= 1
+
+    - name: Render corrected StorageClass with the local mounted filesystem name
+      ansible.builtin.template:
+        src: '{{ playbook_dir }}/../templates/04-storageclass-lab01.yaml.j2'
+        dest: '{{ manifest_dir }}/04-storageclass.yaml'
+        mode: '0600'
+
+    - name: Validate rendered StorageClass identity and backend
+      ansible.builtin.set_fact:
+        desired_sc: '{{ lookup("ansible.builtin.file", manifest_dir + "/04-storageclass.yaml") | from_yaml }}'
+
+    - name: Refuse wrong rendered backend
+      ansible.builtin.assert:
+        that:
+          - desired_sc['metadata']['name'] == scale_storageclass
+          - desired_sc['provisioner'] == 'spectrumscale.csi.ibm.com'
+          - desired_sc['parameters']['clusterId'] == scale_cluster_id
+          - desired_sc['parameters']['volBackendFs'] == local_fs_name
+
+    - name: Inspect existing StorageClass
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', get, storageclass, '{{ scale_storageclass }}', -o, json]
+      register: prior_sc_raw
+      failed_when: prior_sc_raw.rc not in [0, 1]
+      changed_when: false
+
+    - name: Parse existing StorageClass if present
+      ansible.builtin.set_fact:
+        prior_sc: '{{ (prior_sc_raw.stdout | from_json) if prior_sc_raw.rc == 0 else {} }}'
+
+    - name: Reject unrelated StorageClass changes
+      ansible.builtin.assert:
+        that:
+          - >-
+            prior_sc_raw.rc != 0 or
+            (prior_sc['metadata']['name'] == scale_storageclass and
+             prior_sc['provisioner'] == 'spectrumscale.csi.ibm.com' and
+             prior_sc['parameters']['clusterId'] == scale_cluster_id and
+             prior_sc['parameters']['version'] == '2' and
+             prior_sc['parameters']['shared'] == 'false' and
+             prior_sc['parameters']['volBackendFs'] in [local_fs_name, legacy_bad_backend])
+        fail_msg: 'Existing StorageClass is unexpected. Refusing to overwrite it.'
+
+    - name: Set whether the known v1.4 backend requires replacement
+      ansible.builtin.set_fact:
+        needs_legacy_replacement: >-
+          {{ prior_sc_raw.rc == 0 and prior_sc['parameters']['volBackendFs'] == legacy_bad_backend }}
+
+    - name: List all PVCs before replacing a legacy StorageClass
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', get, pvc, --all-namespaces, -o, json]
+      register: all_pvc_raw
+      changed_when: false
+      when: needs_legacy_replacement | bool
+
+    - name: List all PVs before replacing a legacy StorageClass
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', get, pv, -o, json]
+      register: all_pv_raw
+      changed_when: false
+      when: needs_legacy_replacement | bool
+
+    - name: Do not replace a StorageClass referenced by any existing volume or claim
+      ansible.builtin.assert:
+        that:
+          - >-
+            ((all_pvc_raw.stdout | from_json)['items'] | default([]) |
+             selectattr('spec.storageClassName', 'defined') |
+             selectattr('spec.storageClassName','equalto',scale_storageclass) | list | length) == 0
+          - >-
+            ((all_pv_raw.stdout | from_json)['items'] | default([]) |
+             selectattr('spec.storageClassName', 'defined') |
+             selectattr('spec.storageClassName','equalto',scale_storageclass) | list | length) == 0
+        fail_msg: 'Existing claims or volumes use fusionfs1; refusing destructive class replacement.'
+      when: needs_legacy_replacement | bool
+
+    - name: Validate corrected manifest locally before any deletion
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', create, '--dry-run=client', '--validate=strict', -f, '{{ manifest_dir }}/04-storageclass.yaml']
+      changed_when: false
+
+    - name: Delete ONLY the unused and known incorrect v1.4 StorageClass
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', delete, storageclass, '{{ scale_storageclass }}']
+      when: needs_legacy_replacement | bool
+
+    - name: Validate corrected StorageClass with live API after any old class removal
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', apply, '--dry-run=server', '--validate=strict', -f, '{{ manifest_dir }}/04-storageclass.yaml']
+      changed_when: false
+
+    - name: Apply verified StorageClass with correct local mounted filesystem
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', apply, -f, '{{ manifest_dir }}/04-storageclass.yaml']
+      register: sc_result
+      changed_when: "'created' in sc_result.stdout or 'configured' in sc_result.stdout"
+
+    - name: Read back the actual StorageClass
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', get, storageclass, '{{ scale_storageclass }}', -o, json]
+      register: final_sc_raw
+      changed_when: false
+
+    - name: Confirm corrected backend and live remote cluster ID
+      ansible.builtin.assert:
+        that:
+          - (final_sc_raw.stdout | from_json)['parameters']['clusterId'] == scale_cluster_id
+          - (final_sc_raw.stdout | from_json)['parameters']['volBackendFs'] == local_fs_name
+
+    - name: Final StorageClass summary
+      ansible.builtin.debug:
+        msg: 'PASS: {{ scale_storageclass }} uses live remote ID {{ scale_cluster_id }} with verified local filesystem {{ local_fs_name }}.'

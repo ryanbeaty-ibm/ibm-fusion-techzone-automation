@@ -1,0 +1,193 @@
+---
+# IBM Fusion / Fusion Data Foundation 2.14.x - Phase 4D
+# Read-only cluster inventory by default.
+# Even with generate_manifest=true, writes ONLY a local review manifest.
+# NO 'oc create', 'oc apply', disk claims, or cluster writes.
+- name: Phase 4D - Audit Data Foundation service and plan installation (never apply)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    fusion_namespace: ibm-spectrum-fusion-ns
+    data_namespace: openshift-storage
+    service_instance_name: odfmanager
+    service_definition_name: data-foundation-service
+    generate_manifest: false
+    plan_path: "{{ playbook_dir }}/../plans/odfmanager-review.yaml"
+
+  tasks:
+    - name: "01 | Confirm OpenShift authentication"
+      ansible.builtin.command:
+        argv: [oc, whoami]
+      register: identity
+      changed_when: false
+
+    - name: "02 | Inspect IBM Fusion custom resource"
+      ansible.builtin.command:
+        argv: [oc, get, spectrumfusion, spectrumfusion, -n, "{{ fusion_namespace }}", -o, json]
+      register: fusion_lookup
+      changed_when: false
+      failed_when: false
+
+    - name: "02 | Inspect Fusion Data Foundation service definition"
+      ansible.builtin.command:
+        argv: [oc, get, fusionservicedefinition, "{{ service_definition_name }}", -n, "{{ fusion_namespace }}", -o, json]
+      register: definition_lookup
+      changed_when: false
+      failed_when: false
+
+    - name: "02 | Inventory existing Fusion service instances"
+      ansible.builtin.command:
+        argv: [oc, get, fusionserviceinstances.service.isf.ibm.com, --all-namespaces, -o, json]
+      register: instances_lookup
+      changed_when: false
+      failed_when: false
+
+    - name: "02 | Inventory IBM Fusion Operator CSVs"
+      ansible.builtin.command:
+        argv: [oc, get, csv, -n, "{{ fusion_namespace }}", -o, json]
+      register: csv_lookup
+      changed_when: false
+      failed_when: false
+
+    - name: "02 | Check whether StorageCluster API exists"
+      ansible.builtin.command:
+        argv: [oc, get, crd, storageclusters.ocs.openshift.io, -o, name]
+      register: storagecluster_crd
+      changed_when: false
+      failed_when: false
+
+    - name: "02 | Inventory existing StorageClusters when API is available"
+      ansible.builtin.command:
+        argv: [oc, get, storageclusters.ocs.openshift.io, --all-namespaces, -o, json]
+      register: clusters_lookup
+      changed_when: false
+      failed_when: false
+      when: storagecluster_crd.rc == 0
+
+    - name: "03 | Require readable Fusion inventory"
+      ansible.builtin.assert:
+        that:
+          - fusion_lookup.rc == 0
+          - definition_lookup.rc == 0
+          - instances_lookup.rc == 0
+          - csv_lookup.rc == 0
+          - storagecluster_crd.rc != 0 or clusters_lookup.rc == 0
+        fail_msg: >-
+          STOP - Could not read the required Fusion state. Confirm the base Operator,
+          SpectrumFusion instance, service definition, and cluster permissions.
+        success_msg: "PASS - IBM Fusion base and Data Foundation service definition are readable"
+
+    - name: "03 | Parse cluster inventory"
+      ansible.builtin.set_fact:
+        fusion_data: "{{ fusion_lookup.stdout | from_json }}"
+        definition_data: "{{ definition_lookup.stdout | from_json }}"
+        instances_data: "{{ instances_lookup.stdout | from_json }}"
+        csv_data: "{{ csv_lookup.stdout | from_json }}"
+        clusters_data: "{{ (clusters_lookup.stdout | from_json) if storagecluster_crd.rc == 0 else {'items': []} }}"
+
+    - name: "04 | Find existing Data Foundation service instances"
+      ansible.builtin.set_fact:
+        same_name_instances: >-
+          {{ instances_data['items'] |
+             selectattr('metadata.name', 'equalto', service_instance_name) | list }}
+        installed_fusion_csvs: >-
+          {{ csv_data['items'] |
+             selectattr('metadata.name', 'match', '^isf-operator[.]') |
+             selectattr('status.phase', 'equalto', 'Succeeded') | list }}
+
+    - name: "04 | Identify installed Data Foundation service in expected namespace"
+      ansible.builtin.set_fact:
+        target_instances: >-
+          {{ same_name_instances |
+             selectattr('metadata.namespace', 'equalto', fusion_namespace) | list }}
+
+    - name: "05 | Show installed service state"
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'EXISTING - ' ~ service_instance_name ~ ' detected in ' ~ fusion_namespace
+             if (target_instances | length) == 1 else
+             'NOT FOUND - No ' ~ service_instance_name ~ ' instance in ' ~ fusion_namespace }}.
+          Fusion Operator successful CSVs={{ installed_fusion_csvs | length }};
+          StorageClusters={{ clusters_data['items'] | length }};
+          total same-name service instances={{ same_name_instances | length }}.
+          No cluster resources were modified.
+
+    - name: "05 | Show installed service health and installation condition"
+      ansible.builtin.debug:
+        msg:
+          - "Service health={{ (target_instances[0].get('status', {})).get('health', 'not reported') }}"
+          - "Install status={{ (target_instances[0].get('status', {})).get('installStatus', {}).get('status', 'not reported') }}"
+          - "Existing instance will not be changed or reinstalled."
+      when: (target_instances | length) == 1
+
+    - name: "06 | Report default read-only completion"
+      ansible.builtin.debug:
+        msg: >-
+          READ-ONLY COMPLETE. No service manifest generated, no StorageCluster/LocalVolumeSet
+          created, and no disks touched. Explicitly request generate_manifest=true only on
+          a fresh cluster after reviewing IBM's version-specific installation guidance.
+      when: not (generate_manifest | bool)
+
+    - name: "07 | Optional LOCAL review-only service manifest"
+      when: generate_manifest | bool
+      block:
+        - name: "07 | Block any existing service or StorageCluster from being overwritten"
+          ansible.builtin.assert:
+            that:
+              - (same_name_instances | length) == 0
+              - (clusters_data['items'] | length) == 0
+              - (installed_fusion_csvs | length) >= 1
+              - fusion_data['spec']['license']['accept'] | default(false) | bool
+              - definition_data['metadata']['name'] == service_definition_name
+            fail_msg: >-
+              STOP - Existing service/StorageCluster or unmet Fusion prerequisite detected.
+              Do not generate a new Data Foundation installation manifest against a running
+              or partially installed storage service.
+            success_msg: "PASS - Service planning prerequisites satisfied for manual review"
+
+        - name: "08 | Create local review directory"
+          ansible.builtin.file:
+            path: "{{ plan_path | dirname }}"
+            state: directory
+            mode: '0700'
+
+        - name: "09 | Write LOCAL review manifest; NEVER apply"
+          ansible.builtin.copy:
+            dest: "{{ plan_path }}"
+            mode: '0600'
+            content: |
+              # REVIEW ONLY - Do not apply without validating against IBM Fusion's
+              # documentation for the exact installed release and environment.
+              # Installing this service does NOT configure Ceph local disks.
+              apiVersion: service.isf.ibm.com/v1
+              kind: FusionServiceInstance
+              metadata:
+                name: {{ service_instance_name }}
+                namespace: {{ fusion_namespace }}
+              spec:
+                creator: User
+                doInstall: true
+                parameters:
+                  - name: namespace
+                    provided: false
+                    value: {{ data_namespace }}
+                  - name: creator
+                    provided: false
+                    value: Fusion
+                  - name: backingStorageType
+                    provided: true
+                    value: Local
+                  - name: autoUpgrade
+                    provided: true
+                    value: "false"
+                serviceDefinition: {{ service_definition_name }}
+                triggerUpdate: false
+
+        - name: "10 | Report review manifest path"
+          ansible.builtin.debug:
+            msg: >-
+              LOCAL REVIEW FILE WRITTEN: {{ plan_path }}.
+              No oc apply/create was run. Validate version-specific fields,
+              prerequisites, and explicit manual approval before any future deployment.

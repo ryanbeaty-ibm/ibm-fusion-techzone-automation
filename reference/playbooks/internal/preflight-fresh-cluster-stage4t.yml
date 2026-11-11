@@ -1,0 +1,213 @@
+---
+# Phase 4T | Reusable, read-only fresh OpenShift cluster installation preflight.
+# Pin the exact API and supply the intended kubeconfig on the CLI.
+# Does NOT deploy, approve InstallPlans, accept license, or modify disks.
+- name: 'Phase 4T | Fresh-cluster inventory and safety preflight'
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    kubeconfig_path: ''
+    expected_api_server: ''
+    expected_ocp_minor: '4.21'
+    expected_fusion_csv: 'isf-operator.v2.14.1'
+    default_kubeconfig: "{{ lookup('env', 'HOME') }}/.kube/config"
+    required_catalogs:
+      - ibm-operator-catalog
+      - redhat-operators
+
+  tasks:
+    - name: '00 | Require explicit new-cluster binding and read-only mode'
+      ansible.builtin.assert:
+        that:
+          - kubeconfig_path | length > 0
+          - kubeconfig_path != default_kubeconfig
+          - expected_api_server is match('^https://[^/]+:6443$')
+          - not (operator_phase_apply | default(false) | bool)
+          - not (deploy | default(false) | bool)
+          - not (install_operators | default(false) | bool)
+          - not (initialize_fusion | default(false) | bool)
+          - not (accept_ibm_license | default(false) | bool)
+          - not (install_data_foundation | default(false) | bool)
+          - not (approve_disk_claim | default(false) | bool)
+          - not (apply | default(false) | bool)
+        success_msg: 'PASS - Explicit alternate kubeconfig/API pin; audit-only mode'
+        fail_msg: 'STOP - Supply the alternate kubeconfig and API pin; deployment flags are forbidden'
+
+    - name: '01 | Check alternate kubeconfig file'
+      ansible.builtin.stat:
+        path: '{{ kubeconfig_path }}'
+      register: t_kubeconfig
+
+    - name: '01 | Require existing regular kubeconfig'
+      ansible.builtin.assert:
+        that:
+          - t_kubeconfig.stat.exists
+          - t_kubeconfig.stat.isreg
+        fail_msg: 'STOP - Alternate kubeconfig does not exist: {{ kubeconfig_path }}'
+
+    - name: '02 | Identify target API endpoint'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami, --show-server]
+      changed_when: false
+      register: t_api
+
+    - name: '02 | Confirm OpenShift identity'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami]
+      changed_when: false
+      register: t_user
+
+    - name: '02 | Assert exact API binding before cluster inventory'
+      ansible.builtin.assert:
+        that:
+          - (t_api.stdout | trim) == (expected_api_server | trim)
+        success_msg: 'PASS - API pin verified for {{ t_api.stdout | trim }}'
+        fail_msg: 'STOP - API server mismatch; no further cluster calls'
+
+    - name: '03 | Read OpenShift release'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, clusterversion, version, -o, 'jsonpath={.status.desired.version}']
+      changed_when: false
+      register: t_ocp
+
+    - name: '03 | Read node readiness'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, nodes, -o, json]
+      changed_when: false
+      register: t_nodes_result
+
+    - name: '03 | Read ClusterOperator health'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, clusteroperators, -o, json]
+      changed_when: false
+      register: t_cos_result
+
+    - name: '04 | Read installed Operator CSVs'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, csv, -A, -o, json]
+      changed_when: false
+      register: t_csvs_result
+
+    - name: '04 | Read existing Subscriptions'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, subscriptions, -A, -o, json]
+      changed_when: false
+      register: t_subs_result
+
+    - name: '05 | Read marketplace catalogs'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, catalogsource, -n, openshift-marketplace, -o, json]
+      changed_when: false
+      register: t_catalogs_result
+
+    - name: '05 | Read Fusion package metadata'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, packagemanifest, isf-operator, -n, openshift-marketplace, -o, json, --ignore-not-found]
+      changed_when: false
+      failed_when: false
+      register: t_fusion_pkg_result
+
+    - name: '05 | Read Local Storage package metadata'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, packagemanifest, local-storage-operator, -n, openshift-marketplace, -o, json, --ignore-not-found]
+      changed_when: false
+      failed_when: false
+      register: t_local_pkg_result
+
+    - name: '06 | Read StorageClasses (capacity not established)'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, storageclass, -o, json]
+      changed_when: false
+      register: t_sc_result
+
+    - name: '06 | Check existence of pull-secret only (never read secret contents)'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, secret, pull-secret, -n, openshift-config, -o, name]
+      changed_when: false
+      failed_when: false
+      register: t_pull_secret
+
+    - name: '07 | Parse compact, safe inventory'
+      ansible.builtin.set_fact:
+        t_nodes: "{{ (t_nodes_result.stdout | from_json)['items'] }}"
+        t_cos: "{{ (t_cos_result.stdout | from_json)['items'] }}"
+        t_csvs: "{{ (t_csvs_result.stdout | from_json)['items'] }}"
+        t_subs: "{{ (t_subs_result.stdout | from_json)['items'] }}"
+        t_catalogs: "{{ (t_catalogs_result.stdout | from_json)['items'] | map(attribute='metadata.name') | list }}"
+        t_scs: "{{ (t_sc_result.stdout | from_json)['items'] | map(attribute='metadata.name') | list }}"
+        t_fusion_pkg: "{{ (t_fusion_pkg_result.stdout | from_json) if (t_fusion_pkg_result.rc == 0 and t_fusion_pkg_result.stdout | trim | length > 0) else {} }}"
+        t_local_pkg_found: "{{ t_local_pkg_result.rc == 0 and t_local_pkg_result.stdout | trim | length > 0 }}"
+        t_unready: []
+        t_unhealthy_cos: []
+
+    - name: '07 | Identify non-Ready nodes'
+      ansible.builtin.set_fact:
+        t_unready: "{{ t_unready + [item.metadata.name] }}"
+      vars:
+        t_node_ready: "{{ item.status.conditions | default([]) | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | first | default('Unknown') }}"
+      when: t_node_ready != 'True'
+      loop: '{{ t_nodes }}'
+      loop_control:
+        label: '{{ item.metadata.name }}'
+
+    - name: '07 | Identify unavailable or degraded ClusterOperators'
+      ansible.builtin.set_fact:
+        t_unhealthy_cos: "{{ t_unhealthy_cos + [item.metadata.name] }}"
+      vars:
+        t_available: "{{ item.status.conditions | default([]) | selectattr('type', 'equalto', 'Available') | map(attribute='status') | first | default('Unknown') }}"
+        t_degraded: "{{ item.status.conditions | default([]) | selectattr('type', 'equalto', 'Degraded') | map(attribute='status') | first | default('Unknown') }}"
+      when: t_available != 'True' or t_degraded == 'True'
+      loop: '{{ t_cos }}'
+      loop_control:
+        label: '{{ item.metadata.name }}'
+
+    - name: '08 | Normalize Fusion status and package channel'
+      ansible.builtin.set_fact:
+        t_fusion_csvs: "{{ t_csvs | selectattr('metadata.name', 'match', '^isf-operator[.]') | list }}"
+        t_fusion_subs: "{{ t_subs | selectattr('spec.name', 'defined') | selectattr('spec.name', 'equalto', 'isf-operator') | list }}"
+        t_fusion_v2_csv: >-
+          {{ t_fusion_pkg.get('status', {}).get('channels', []) |
+             selectattr('name', 'equalto', 'v2.0') |
+             map(attribute='currentCSV') | first | default('') }}
+        t_fusion_catalog: "{{ t_fusion_pkg.get('status', {}).get('catalogSource', '') }}"
+
+    - name: '09 | Show fresh-cluster audit summary'
+      ansible.builtin.debug:
+        msg:
+          - 'Target={{ t_api.stdout | trim }}; login={{ t_user.stdout | trim }}'
+          - 'Kubeconfig={{ kubeconfig_path }}; API pin=VERIFIED'
+          - 'OpenShift={{ t_ocp.stdout | trim }}; nodes={{ t_nodes | length }}; not Ready={{ t_unready | length }}'
+          - 'Unhealthy ClusterOperators={{ t_unhealthy_cos | join(", ") if t_unhealthy_cos | length > 0 else "none" }}'
+          - 'IBM Fusion CSVs={{ t_fusion_csvs | length }}; Subscriptions={{ t_fusion_subs | length }}'
+          - 'Fusion v2.0 catalog={{ t_fusion_catalog or "NOT FOUND" }}; available CSV={{ t_fusion_v2_csv or "NOT FOUND" }}'
+          - 'Required catalogs present={{ required_catalogs | difference(t_catalogs) | length == 0 }}'
+          - 'Local Storage package present={{ t_local_pkg_found }}'
+          - 'StorageClasses={{ t_scs | join(", ") if t_scs | length else "none" }}'
+          - 'Cluster pull-secret exists={{ t_pull_secret.rc == 0 }}; IBM registry entitlement NOT VERIFIED'
+          - 'Dynamic RWO storage free capacity NOT VERIFIED; disk safety NOT VERIFIED'
+          - 'No writes or InstallPlan approvals performed'
+
+    - name: '10 | Require stable, clean cluster and correct Fusion catalog for bootstrap review'
+      ansible.builtin.assert:
+        that:
+          - t_ocp.stdout is match('^' ~ (expected_ocp_minor | regex_escape) ~ '[.]')
+          - t_nodes | length >= 3
+          - t_unready | length == 0
+          - t_unhealthy_cos | length == 0
+          - t_fusion_csvs | length == 0
+          - t_fusion_subs | length == 0
+          - required_catalogs | difference(t_catalogs) | length == 0
+          - t_fusion_catalog == 'ibm-operator-catalog'
+          - t_fusion_v2_csv == expected_fusion_csv
+          - t_local_pkg_found | bool
+        success_msg: 'PASS - Fresh-cluster checks passed. Next: review registry entitlement, RWO capacity, and IBM version-specific sizing BEFORE separately authorizing Phase 4L.'
+        fail_msg: 'STOP - Cluster is not a clean, stable, supported bootstrap candidate. Review preceding inventory; no resources were changed.'
+
+    - name: '99 | Explicit non-certification of installation safety'
+      ansible.builtin.debug:
+        msg:
+          - 'PRE-FLIGHT PASSED - Read-only cluster inventory completed.'
+          - 'NOT YET APPROVED - Registry entitlement, usable dynamic RWO capacity, and disk selection must be independently validated.'
+          - 'Do not enable operator_phase_apply or initialize_fusion from this preflight.'

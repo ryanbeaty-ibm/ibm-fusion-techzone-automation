@@ -1,0 +1,15 @@
+# DRAFT ONLY. Secret is intentionally NOT created in the starter.
+# The GUI identity must have the IBM Scale ContainerOperator privileges required for remote mounts.
+apiVersion: scale.spectrum.ibm.com/v1beta1
+kind: RemoteCluster
+metadata:
+  name: {{ scale_name }}
+  namespace: {{ scale_namespace }}
+spec:
+  gui:
+    hosts:
+      - '{{ scale_management_host }}'
+    port: {{ scale_management_port }}
+    scheme: https
+    secretName: {{ scale_gui_secret_name }}
+    insecureSkipVerify: {{ 'true' if scale_insecure_skip_verify else 'false' }}

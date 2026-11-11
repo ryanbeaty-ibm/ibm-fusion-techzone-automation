@@ -1,0 +1,86 @@
+---
+- name: Lab 01 | Mount pre-existing external Scale filesystem fs1
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    manifest_file: '{{ playbook_dir }}/../build/scale-lab01/03-filesystem.yaml'
+  tasks:
+    - name: Require exact Lab 01 configuration
+      ansible.builtin.assert:
+        that:
+          - scale_apply_enabled | bool
+          - kubeconfig == '/home/automation/.kube/lab01.conf'
+          - scale_name == 'lab01-external-scale'
+          - scale_filesystem == 'fs1'
+          - scale_namespace == 'ibm-spectrum-scale'
+    - name: Check actual connected cluster
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', whoami, --show-server]
+      register: actual_api
+      changed_when: false
+    - name: Verify correct cluster
+      ansible.builtin.assert:
+        that:
+          - actual_api.stdout == 'https://api.itz-s6fyum.infra01-lb.wdc04.techzone.ibm.com:6443'
+    - name: Inspect remote GUI connection state
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, '{{ scale_namespace }}', get, remotecluster.scale.spectrum.ibm.com, '{{ scale_name }}', -o, json]
+      register: remote_state
+      changed_when: false
+    - name: Require a ready connection
+      ansible.builtin.assert:
+        that:
+          - >-
+            ((remote_state.stdout | from_json)['status']['conditions'] | default([]) |
+             selectattr('type', 'equalto', 'Ready') |
+             selectattr('status', 'equalto', 'True') | list | length) == 1
+          - ((remote_state.stdout | from_json)['spec']['gui']['hosts']) == [scale_management_host]
+    - name: Validate intended Filesystem manifest
+      ansible.builtin.set_fact:
+        fs_manifest: "{{ lookup('ansible.builtin.file', manifest_file) | from_yaml }}"
+    - name: Refuse unexpected Filesystem specification
+      ansible.builtin.assert:
+        that:
+          - fs_manifest['kind'] == 'Filesystem'
+          - fs_manifest['metadata']['namespace'] == scale_namespace
+          - fs_manifest['metadata']['name'] == scale_name + '-fs1'
+          - fs_manifest['spec']['remote']['cluster'] == scale_name
+          - fs_manifest['spec']['remote']['fs'] == 'fs1'
+    - name: Check any existing Filesystem objects
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, '{{ scale_namespace }}', get, filesystems.scale.spectrum.ibm.com, -o, json]
+      register: existing_filesystems
+      changed_when: false
+    - name: Block conflicting Filesystem mounts
+      ansible.builtin.assert:
+        that:
+          - >-
+            (((existing_filesystems.stdout | from_json)['items'] | length) == 0) or
+            (((existing_filesystems.stdout | from_json)['items'] | length) == 1 and
+             (existing_filesystems.stdout | from_json)['items'][0]['metadata']['name'] == scale_name + '-fs1' and
+             (existing_filesystems.stdout | from_json)['items'][0]['spec']['remote'] == fs_manifest['spec']['remote'])
+    - name: Server-validate the Filesystem now that remote authentication is Ready
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, '{{ scale_namespace }}', apply, '--dry-run=server', '--validate=strict', -f, '{{ manifest_file }}']
+      changed_when: false
+    - name: Apply only the requested remote Filesystem resource
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, '{{ scale_namespace }}', apply, -f, '{{ manifest_file }}']
+      register: applied_fs
+      changed_when: "'created' in applied_fs.stdout or 'configured' in applied_fs.stdout"
+    - name: Wait for remote filesystem mount Success=True (up to 40 minutes)
+      ansible.builtin.shell: |
+        set -o pipefail
+        oc --kubeconfig='{{ kubeconfig }}' -n '{{ scale_namespace }}' get filesystem.scale.spectrum.ibm.com '{{ scale_name }}-fs1' -o json |
+        jq -r 'if any(.status.conditions[]?; .type=="Success" and .status=="True") then "ready" else "waiting" end'
+      args:
+        executable: /bin/bash
+      register: fs_poll
+      until: fs_poll.rc == 0 and fs_poll.stdout == 'ready'
+      retries: 240
+      delay: 10
+      changed_when: false
+    - name: Report configured external filesystem
+      ansible.builtin.debug:
+        msg: 'PASS: remote fs1 configured and mounted into the OpenShift Scale client.'

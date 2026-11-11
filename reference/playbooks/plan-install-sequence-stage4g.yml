@@ -1,0 +1,188 @@
+---
+# Stage 4G - IBM Storage Fusion installation sequence planner
+# READ ONLY. No oc apply/create/patch/delete. Does not perform real installation.
+# Analyze live installed resources or use scenario=... for offline branch tests.
+# Next step is advisory and requires IBM-version-specific review before execution.
+- name: "Phase 4G | Safe installation sequence and state-gate planner"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    scenario: ""                # Live cluster unless overridden with -e scenario=...
+    permitted_scenarios:
+      - ""
+      - empty
+      - operator_only
+      - fusion_initialized
+      - service_installed
+      - local_pvs_ready
+      - storagecluster_pending
+      - complete
+    fusion_namespace: ibm-spectrum-fusion-ns
+    fusion_instance_name: spectrumfusion
+    service_instance_name: odfmanager
+    local_storage_class: fusion-ceph-local
+
+  tasks:
+    - name: "00 | Block all write-capable switches"
+      ansible.builtin.assert:
+        that:
+          - not (install_operators | default(false) | bool)
+          - not (initialize_fusion | default(false) | bool)
+          - not (accept_ibm_license | default(false) | bool)
+          - not (generate_manifest | default(false) | bool)
+          - not (run_persistence_test | default(false) | bool)
+          - not (install_data_foundation | default(false) | bool)
+          - not (approve_disk_claim | default(false) | bool)
+          - scenario in permitted_scenarios
+        success_msg: "PASS - READ-ONLY planner. Nothing can be installed or claimed."
+        fail_msg: "STOP - Installation switches or unrecognized scenario are not allowed."
+
+    - name: "01 | Confirm OpenShift login (live mode)"
+      ansible.builtin.command:
+        argv: [oc, whoami]
+      register: g_identity
+      changed_when: false
+      when: scenario == ''
+
+    - name: "01 | Discover CSVs (live mode)"
+      ansible.builtin.command:
+        argv: [oc, get, csv, -A, -o, json]
+      register: g_csv_cmd
+      changed_when: false
+      when: scenario == ''
+
+    - name: "01 | Discover CRDs (live mode)"
+      ansible.builtin.command:
+        argv: [oc, get, crd, -o, json]
+      register: g_crd_cmd
+      changed_when: false
+      when: scenario == ''
+
+    - name: "01 | Parse capability inventory (live mode)"
+      ansible.builtin.set_fact:
+        g_csvs: "{{ (g_csv_cmd.stdout | from_json)['items'] }}"
+        g_crd_names: "{{ (g_crd_cmd.stdout | from_json)['items'] | map(attribute='metadata.name') | list }}"
+      when: scenario == ''
+
+    - name: "01 | Discover SpectrumFusion custom resource (if API exists)"
+      ansible.builtin.command:
+        argv: [oc, get, spectrumfusion, "{{ fusion_instance_name }}", -n, "{{ fusion_namespace }}", -o, json, --ignore-not-found]
+      register: g_fusion_cmd
+      changed_when: false
+      when:
+        - scenario == ''
+        - "'spectrumfusions.prereq.isf.ibm.com' in g_crd_names"
+
+    - name: "01 | Discover Data Foundation service instance (if API exists)"
+      ansible.builtin.command:
+        argv: [oc, get, fusionserviceinstance, "{{ service_instance_name }}", -n, "{{ fusion_namespace }}", -o, json, --ignore-not-found]
+      register: g_service_cmd
+      changed_when: false
+      when:
+        - scenario == ''
+        - "'fusionserviceinstances.service.isf.ibm.com' in g_crd_names"
+
+    - name: "01 | Discover LocalVolumeSets (if API exists)"
+      ansible.builtin.command:
+        argv: [oc, get, localvolumesets, -A, -o, json]
+      register: g_lvs_cmd
+      changed_when: false
+      when:
+        - scenario == ''
+        - "'localvolumesets.local.storage.openshift.io' in g_crd_names"
+
+    - name: "01 | Discover StorageClusters (if API exists)"
+      ansible.builtin.command:
+        argv: [oc, get, storageclusters, -A, -o, json]
+      register: g_storage_cmd
+      changed_when: false
+      when:
+        - scenario == ''
+        - "'storageclusters.ocs.openshift.io' in g_crd_names"
+
+    - name: "01 | Read PV inventory (live mode)"
+      ansible.builtin.command:
+        argv: [oc, get, pv, -o, json]
+      register: g_pv_cmd
+      changed_when: false
+      when: scenario == ''
+
+    - name: "02 | Interpret live cluster state"
+      ansible.builtin.set_fact:
+        g_fusion_operator_ready: >-
+          {{ (g_csvs | selectattr('metadata.name', 'match', '^isf-operator[.]') |
+              selectattr('status.phase', 'equalto', 'Succeeded') | list | length > 0) }}
+        g_local_operator_ready: >-
+          {{ (g_csvs | selectattr('metadata.name', 'match', '^local-storage-operator[.]') |
+              selectattr('status.phase', 'equalto', 'Succeeded') | list | length > 0) }}
+        g_fusion_ready: >-
+          {{ g_fusion_cmd is not skipped and
+             (g_fusion_cmd.stdout | default('') | trim | length > 0) and
+             ((g_fusion_cmd.stdout | default('{}') | from_json).spec.license.accept | default(false) | bool) }}
+        g_service_ready: >-
+          {{ g_service_cmd is not skipped and
+             (g_service_cmd.stdout | default('') | trim | length > 0) and
+             ((g_service_cmd.stdout | default('{}') | from_json).status.health | default('') == 'Healthy') }}
+        g_lvs_count: >-
+          {{ ((g_lvs_cmd.stdout | default('{"items":[]}') | from_json)['items'] | length)
+             if g_lvs_cmd is not skipped else 0 }}
+        g_local_pv_count: >-
+          {{ (g_pv_cmd.stdout | from_json)['items'] |
+             selectattr('spec.storageClassName', 'defined') |
+             selectattr('spec.storageClassName', 'equalto', local_storage_class) |
+             list | length }}
+        g_storage_ready: >-
+          {{ ((g_storage_cmd.stdout | default('{"items":[]}') | from_json)['items'] |
+             selectattr('status.phase', 'defined') |
+             selectattr('status.phase', 'equalto', 'Ready') | list | length > 0)
+             if g_storage_cmd is not skipped else false }}
+      when: scenario == ''
+
+    - name: "02 | Interpret simulated fresh-cluster state (no oc calls)"
+      ansible.builtin.set_fact:
+        g_fusion_operator_ready: "{{ scenario in ['operator_only', 'fusion_initialized', 'service_installed', 'local_pvs_ready', 'storagecluster_pending', 'complete'] }}"
+        g_local_operator_ready: "{{ scenario in ['local_pvs_ready', 'storagecluster_pending', 'complete'] }}"
+        g_fusion_ready: "{{ scenario in ['fusion_initialized', 'service_installed', 'local_pvs_ready', 'storagecluster_pending', 'complete'] }}"
+        g_service_ready: "{{ scenario in ['service_installed', 'local_pvs_ready', 'storagecluster_pending', 'complete'] }}"
+        g_lvs_count: "{{ 1 if scenario in ['local_pvs_ready', 'storagecluster_pending', 'complete'] else 0 }}"
+        g_local_pv_count: "{{ 3 if scenario in ['local_pvs_ready', 'storagecluster_pending', 'complete'] else 0 }}"
+        g_storage_ready: "{{ scenario == 'complete' }}"
+      when: scenario != ''
+
+    - name: "03 | Identify first incomplete installation gate"
+      ansible.builtin.set_fact:
+        g_next_gate: >-
+          {% if not (g_fusion_operator_ready | bool) %}
+          1 - Review IBM Fusion Operator catalog/channel/OLM setup. Require Manual InstallPlan approval.
+          {% elif not (g_fusion_ready | bool) %}
+          2 - Review IBM license and SpectrumFusion initialization; wait for Fusion service definitions.
+          {% elif not (g_service_ready | bool) %}
+          3 - Install Data Foundation service in Local mode, then wait for service health=Healthy.
+          {% elif not (g_local_operator_ready | bool) %}
+          4 - Confirm Local Storage Operator deployment has succeeded before provisioning local disks.
+          {% elif (g_lvs_count | int) < 1 or (g_local_pv_count | int) < 3 %}
+          5 - Review three independently verified SSD nodes/disks; require explicit approval before creating LocalVolumeSet / claiming disks.
+          {% elif not (g_storage_ready | bool) %}
+          6 - Configure or wait for StorageCluster; verify OSDs, classes, and Ceph readiness.
+          {% else %}
+          COMPLETE - All high-level gates found. Run functional verification separately.
+          {% endif %}
+
+    - name: "04 | Display concise sequence result"
+      ansible.builtin.debug:
+        msg:
+          - "Mode={{ 'LIVE' if scenario == '' else 'SIMULATED: ' ~ scenario }}"
+          - "IBM Fusion Operator={{ 'PASS' if g_fusion_operator_ready | bool else 'PENDING' }}"
+          - "Local Storage Operator={{ 'PASS' if g_local_operator_ready | bool else 'PENDING' }}"
+          - "SpectrumFusion with accepted license={{ 'PASS' if g_fusion_ready | bool else 'PENDING' }}"
+          - "Data Foundation service Healthy={{ 'PASS' if g_service_ready | bool else 'PENDING' }}"
+          - "LocalVolumeSets={{ g_lvs_count }}; local {{ local_storage_class }} PVs={{ g_local_pv_count }}"
+          - "Ceph StorageCluster Ready={{ 'PASS' if g_storage_ready | bool else 'PENDING' }}"
+          - "Next gate: {{ g_next_gate | trim }}"
+          - "READ-ONLY. This is a logical planner, NOT a tested fresh-install or disk safety certification."
+
+    - name: "99 | Finish without cluster changes"
+      ansible.builtin.debug:
+        msg: "PASS - Sequence analysis completed. No write commands were executed."

@@ -1,0 +1,7 @@
+# Example only. Copy to config/local/techzone-2.yml after verifying lab identity.
+# NEVER point to the protected original POC cluster.
+kubeconfig_path: /home/automation/.kube/techzone-2.conf
+expected_api_server: https://api.itz-d4xrcs.infra01-lb.dal14.techzone.ibm.com:6443
+protected_api_server: https://api.itz-qw3pvq.infra02-lb.dal12.techzone.ibm.com:6443
+expected_ocp_minor: '4.21'
+expected_fusion_csv: isf-operator.v2.14.1

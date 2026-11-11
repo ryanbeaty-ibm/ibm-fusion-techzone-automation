@@ -1,0 +1,309 @@
+---
+# Phase 4N - Controlled approval of ONE existing IBM Fusion Operator InstallPlan.
+# DEFAULT: READ-ONLY. `scenario=empty` and `scenario=pending` make NO oc calls.
+# Requires explicit kubeconfig and pinning of server, InstallPlan name and UID to patch.
+# Does not install Fusion CR, Data Foundation, or any LocalVolumeSet / Ceph disks.
+- name: 'Phase 4N | Review and separately authorize one Fusion InstallPlan'
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    scenario: live
+    kubeconfig_path: "{{ lookup('env', 'HOME') }}/.kube/config"
+    default_kubeconfig_path: "{{ lookup('env', 'HOME') }}/.kube/config"
+    expected_api_server: ''
+    fusion_namespace: ibm-spectrum-fusion-ns
+    fusion_package: isf-operator
+    fusion_catalog: ibm-operator-catalog
+    fusion_channel: v2.0
+    expected_fusion_csv: isf-operator.v2.14.1
+    approve_fusion_installplan: false
+    target_installplan_name: ''
+    expected_installplan_uid: ''
+    fusion_installplan_approval_phrase: ''
+
+  tasks:
+    - name: '00 | Block unrelated deployment switches and simulation writes'
+      ansible.builtin.assert:
+        that:
+          - scenario in ['live', 'empty', 'pending']
+          - not (operator_phase_apply | default(false) | bool)
+          - not (approve_installplan | default(false) | bool)
+          - not (install_operators | default(false) | bool)
+          - not (initialize_fusion | default(false) | bool)
+          - not (install_data_foundation | default(false) | bool)
+          - not (approve_disk_claim | default(false) | bool)
+          - not (deploy | default(false) | bool)
+          - not (apply | default(false) | bool)
+          - scenario == 'live' or not (approve_fusion_installplan | bool)
+        fail_msg: 'BLOCKED - Unsupported flag or attempt to write in simulation mode'
+        success_msg: 'PASS - Stage 4N has no implicit approval path'
+
+    - name: '01 | Simulate a cluster with no Subscription (offline)'
+      ansible.builtin.debug:
+        msg:
+          - 'SIMULATION - No Subscription or InstallPlan yet'
+          - 'Run Phase 4L bootstrap on the explicitly pinned fresh cluster first'
+          - 'Phase 4M must review the resulting Manual InstallPlan'
+          - 'No oc calls or changes'
+      when: scenario == 'empty'
+
+    - name: '01 | Simulate a pending Manual InstallPlan (offline)'
+      ansible.builtin.debug:
+        msg:
+          - 'SIMULATION - Manual Fusion InstallPlan waiting for approval'
+          - 'Stage 4N audits Subscription, exact InstallPlan, CSV, phase and UID'
+          - 'Actual approval additionally requires independent API/name/UID pins and approval phrase'
+          - 'No oc calls or changes'
+      when: scenario == 'pending'
+
+    - name: '02 | Audit live cluster and safely review the candidate'
+      when: scenario == 'live'
+      block:
+        - name: '02 | Inspect kubeconfig path'
+          ansible.builtin.stat:
+            path: '{{ kubeconfig_path }}'
+          register: n_kubeconfig
+
+        - name: '02 | Require existing kubeconfig file'
+          ansible.builtin.assert:
+            that:
+              - n_kubeconfig.stat.exists
+              - n_kubeconfig.stat.isreg
+            fail_msg: 'BLOCKED - kubeconfig not found: {{ kubeconfig_path }}'
+
+        - name: '02 | Discover API endpoint'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami, --show-server]
+          changed_when: false
+          register: n_server
+
+        - name: '02 | Discover identity'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami]
+          changed_when: false
+          register: n_identity
+
+        - name: '02 | Check optional read-only API pin'
+          ansible.builtin.assert:
+            that:
+              - expected_api_server == '' or (n_server.stdout | trim) == (expected_api_server | trim)
+            success_msg: 'PASS - Target API determined; optional endpoint pin checked'
+            fail_msg: 'BLOCKED - kubeconfig points to an unexpected OpenShift cluster'
+
+        - name: '03 | Read Fusion namespace Subscriptions'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, subscriptions, -A, -o, json]
+          changed_when: false
+          register: n_subs_raw
+
+        - name: '03 | Read Fusion namespace InstallPlans'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, installplans, -A, -o, json]
+          changed_when: false
+          register: n_plans_raw
+
+        - name: '03 | Read Fusion namespace CSVs'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, csv, -A, -o, json]
+          changed_when: false
+          register: n_csvs_raw
+
+        - name: '04 | Select IBM Fusion Operator and installed CSV'
+          ansible.builtin.set_fact:
+            n_subs: >-
+              {{ (n_subs_raw.stdout | from_json)['items'] |
+                 selectattr('metadata.namespace', 'equalto', fusion_namespace) |
+                 selectattr('spec.name', 'defined') |
+                 selectattr('spec.name', 'equalto', fusion_package) | list }}
+            n_plans: >-
+              {{ (n_plans_raw.stdout | from_json)['items'] |
+                 selectattr('metadata.namespace', 'equalto', fusion_namespace) | list }}
+            n_installed_csvs: >-
+              {{ (n_csvs_raw.stdout | from_json)['items'] |
+                 selectattr('metadata.namespace', 'equalto', fusion_namespace) |
+                 selectattr('metadata.name', 'equalto', expected_fusion_csv) |
+                 selectattr('status.phase', 'defined') |
+                 selectattr('status.phase', 'equalto', 'Succeeded') | list }}
+
+        - name: '04 | Reject ambiguous Fusion Subscriptions'
+          ansible.builtin.assert:
+            that:
+              - n_subs | length <= 1
+            fail_msg: 'BLOCKED - Multiple IBM Fusion Subscriptions in namespace'
+
+        - name: '04 | Determine Subscription InstallPlan reference'
+          ansible.builtin.set_fact:
+            n_sub_name: "{{ n_subs[0].metadata.name if (n_subs | length == 1) else '' }}"
+            n_plan_name: "{{ n_subs[0].status.installplan.name | default('') if (n_subs | length == 1) else '' }}"
+            n_sub_manual: "{{ (n_subs[0].spec.installPlanApproval | default('')) == 'Manual' if (n_subs | length == 1) else false }}"
+            n_sub_expected: >-
+              {{ ((n_subs[0].spec.name | default('')) == fusion_package and
+                  (n_subs[0].spec.channel | default('')) == fusion_channel and
+                  (n_subs[0].spec.source | default('')) == fusion_catalog and
+                  (n_subs[0].spec.sourceNamespace | default('')) == 'openshift-marketplace')
+                 if (n_subs | length == 1) else false }}
+
+        - name: '04 | Select referenced plan (not some unrelated InstallPlan)'
+          ansible.builtin.set_fact:
+            n_matching_plans: >-
+              {{ n_plans | selectattr('metadata.name', 'equalto', n_plan_name) | list
+                 if (n_plan_name | length > 0) else [] }}
+
+        - name: '04 | Refuse ambiguous InstallPlan matching'
+          ansible.builtin.assert:
+            that:
+              - n_matching_plans | length <= 1
+            fail_msg: 'BLOCKED - Duplicate InstallPlan names'
+
+        - name: '05 | Summarize referenced plan for human review'
+          ansible.builtin.debug:
+            msg:
+              - 'Mode={{ "APPROVAL REQUESTED" if approve_fusion_installplan | bool else "READ ONLY" }}'
+              - 'API={{ n_server.stdout | trim }}; identity={{ n_identity.stdout | trim }}; kubeconfig={{ kubeconfig_path }}'
+              - 'API pin={{ "supplied" if expected_api_server | length > 0 else "not supplied" }}'
+              - 'Succeeded Fusion CSV={{ n_installed_csvs | length > 0 }}'
+              - 'Fusion Subscription count={{ n_subs | length }}; name={{ n_sub_name | default("none") }}'
+              - 'Subscription Manual={{ n_sub_manual }}; expected package/channel/catalog={{ n_sub_expected }}'
+              - 'Subscription-referenced InstallPlan={{ n_plan_name | default("none", true) }}'
+              - 'Referenced plan found={{ n_matching_plans | length == 1 }}'
+              - 'InstallPlan name={{ n_matching_plans[0].metadata.name if (n_matching_plans | length == 1) else "none" }}'
+              - 'InstallPlan UID={{ n_matching_plans[0].metadata.uid if (n_matching_plans | length == 1) else "none" }}'
+              - 'Plan approval={{ n_matching_plans[0].spec.approval | default("unknown") if (n_matching_plans | length == 1) else "n/a" }}'
+              - 'Plan approved={{ n_matching_plans[0].spec.approved | default(false) if (n_matching_plans | length == 1) else "n/a" }}'
+              - 'Plan phase={{ n_matching_plans[0].status.phase | default("unknown") if (n_matching_plans | length == 1) else "n/a" }}'
+              - 'Target CSVs={{ n_matching_plans[0].spec.clusterServiceVersionNames | default([]) if (n_matching_plans | length == 1) else [] }}'
+              - 'Plan resource steps={{ n_matching_plans[0].status.plan | default([]) | length if (n_matching_plans | length == 1) else 0 }}'
+              - 'No approval happens in default mode.'
+
+        - name: '05 | Check any existing Fusion Subscription has correct safety policy'
+          ansible.builtin.assert:
+            that:
+              - n_sub_manual | bool
+              - n_sub_expected | bool
+            fail_msg: 'BLOCKED - Fusion Subscription is not Manual or has unexpected package/catalog/channel'
+          when: n_subs | length == 1
+
+        - name: '05 | Check referenced InstallPlan matches expected Operator CSV and policy'
+          ansible.builtin.assert:
+            that:
+              - n_matching_plans[0].spec.approval | default('') == 'Manual'
+              - expected_fusion_csv in (n_matching_plans[0].spec.clusterServiceVersionNames | default([]))
+            fail_msg: 'BLOCKED - Referenced InstallPlan has unexpected approval policy or CSV'
+          when: n_matching_plans | length == 1
+
+        - name: '06 | REQUIRE all independent pins before permitting one write'
+          ansible.builtin.assert:
+            that:
+              - kubeconfig_path != default_kubeconfig_path
+              - expected_api_server | length > 0
+              - (n_server.stdout | trim) == (expected_api_server | trim)
+              - n_identity.stdout | trim == 'system:admin'
+              - n_subs | length == 1
+              - n_sub_manual | bool
+              - n_sub_expected | bool
+              - n_matching_plans | length == 1
+              - n_installed_csvs | length == 0
+              - target_installplan_name | length > 0
+              - n_plan_name == target_installplan_name
+              - expected_installplan_uid | length > 0
+              - n_matching_plans[0].metadata.uid == expected_installplan_uid
+              - n_matching_plans[0].spec.approval | default('') == 'Manual'
+              - not (n_matching_plans[0].spec.approved | default(false) | bool)
+              - n_matching_plans[0].status.phase | default('') == 'RequiresApproval'
+              - expected_fusion_csv in (n_matching_plans[0].spec.clusterServiceVersionNames | default([]))
+              - fusion_installplan_approval_phrase == 'I_APPROVE_ONLY_FUSION_OPERATOR_INSTALLPLAN'
+            fail_msg: 'BLOCKED - InstallPlan approval requires exact API, name, UID, Manual state, RequiresApproval phase and explicit acknowledgment'
+            success_msg: 'PASS - Scope pinned to one pending IBM Fusion InstallPlan'
+          when: approve_fusion_installplan | bool
+
+        - name: '06 | Verify patch permission for this namespace'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', auth, can-i, patch, installplans.operators.coreos.com, -n, '{{ fusion_namespace }}']
+          changed_when: false
+          register: n_can_patch
+          when: approve_fusion_installplan | bool
+
+        - name: '06 | Require patch privilege'
+          ansible.builtin.assert:
+            that:
+              - n_can_patch.stdout | trim == 'yes'
+            fail_msg: 'BLOCKED - Not authorized to patch InstallPlans in Fusion namespace'
+          when: approve_fusion_installplan | bool
+
+        - name: '07 | Re-read exact plan immediately before patch'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, installplan, '{{ target_installplan_name }}', -n, '{{ fusion_namespace }}', -o, json]
+          changed_when: false
+          register: n_plan_latest_raw
+          when: approve_fusion_installplan | bool
+
+        - name: '07 | Reject drift since audit (UID, phase, version, approval state)'
+          ansible.builtin.assert:
+            that:
+              - (n_plan_latest_raw.stdout | from_json).metadata.uid == expected_installplan_uid
+              - (n_plan_latest_raw.stdout | from_json).spec.approved is defined
+              - (n_plan_latest_raw.stdout | from_json).spec.approval | default('') == 'Manual'
+              - not ((n_plan_latest_raw.stdout | from_json).spec.approved | default(false) | bool)
+              - (n_plan_latest_raw.stdout | from_json).status.phase | default('') == 'RequiresApproval'
+              - expected_fusion_csv in ((n_plan_latest_raw.stdout | from_json).spec.clusterServiceVersionNames | default([]))
+            fail_msg: 'BLOCKED - InstallPlan changed while reviewing; audit again'
+          when: approve_fusion_installplan | bool
+
+        - name: '08 | Build an atomic JSON patch with UID and approval-state tests'
+          ansible.builtin.set_fact:
+            n_atomic_patch:
+              - op: test
+                path: /metadata/uid
+                value: '{{ expected_installplan_uid }}'
+              - op: test
+                path: /spec/approval
+                value: Manual
+              - op: test
+                path: /spec/approved
+                value: false
+              - op: replace
+                path: /spec/approved
+                value: true
+          when: approve_fusion_installplan | bool
+
+        - name: '08 | Approve ONLY the reviewed Manual IBM Fusion Operator InstallPlan'
+          ansible.builtin.command:
+            argv:
+              - oc
+              - '--kubeconfig={{ kubeconfig_path }}'
+              - patch
+              - installplan
+              - '{{ target_installplan_name }}'
+              - -n
+              - '{{ fusion_namespace }}'
+              - --type=json
+              - -p
+              - '{{ n_atomic_patch | to_json }}'
+          register: n_patch_result
+          changed_when: true
+          when: approve_fusion_installplan | bool
+
+        - name: '09 | Confirm approval flag on exact InstallPlan'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, installplan, '{{ target_installplan_name }}', -n, '{{ fusion_namespace }}', -o, json]
+          changed_when: false
+          register: n_approved_plan_raw
+          when: approve_fusion_installplan | bool
+
+        - name: '09 | Validate approval persisted without claiming CSV succeeded'
+          ansible.builtin.assert:
+            that:
+              - (n_approved_plan_raw.stdout | from_json).metadata.uid == expected_installplan_uid
+              - (n_approved_plan_raw.stdout | from_json).spec.approved | bool
+            success_msg: 'PASS - Exact InstallPlan approved. OLM installation is asynchronous; verify CSV Succeeded separately.'
+            fail_msg: 'ERROR - Approval state could not be confirmed'
+          when: approve_fusion_installplan | bool
+
+    - name: '99 | Phase 4N completion'
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Phase 4N approval attempted only for the explicitly pinned plan. Check the result above and verify CSV separately.'
+             if approve_fusion_installplan | bool else
+             'PASS - Phase 4N audit/simulation completed with no cluster modifications.' }}

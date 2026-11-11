@@ -1,0 +1,114 @@
+---
+- name: Verify IBM Fusion environment
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: "01 | Check OpenShift authentication"
+      ansible.builtin.command: oc whoami
+      register: identity
+      changed_when: false
+
+    - name: "01 | Authentication result"
+      ansible.builtin.debug:
+        msg: "PASS - Connected as {{ identity.stdout }}"
+
+    - name: "02 | Wait for all OpenShift nodes to be Ready"
+      ansible.builtin.command:
+        argv:
+          - oc
+          - wait
+          - node
+          - --all
+          - --for=condition=Ready
+          - --timeout=120s
+      register: nodes
+      changed_when: false
+
+    - name: "02 | Node readiness result"
+      ansible.builtin.debug:
+        msg: "PASS - {{ nodes.stdout_lines | length }} nodes Ready"
+
+    - name: "03 | Check Ceph storage cluster status"
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - storagecluster
+          - ocs-storagecluster
+          - -n
+          - openshift-storage
+          - -o
+          - 'jsonpath={.status.phase}'
+      register: ceph
+      changed_when: false
+
+    - name: "03 | Validate Ceph readiness"
+      ansible.builtin.assert:
+        that:
+          - ceph.stdout | trim == "Ready"
+        success_msg: "PASS - Ceph storage cluster is Ready"
+        fail_msg: "FAIL - Ceph status: {{ ceph.stdout }}"
+
+    - name: "04 | Check Ceph block StorageClass"
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - storageclass
+          - ocs-storagecluster-ceph-rbd
+          - -o
+          - name
+      register: storageclass
+      changed_when: false
+
+    - name: "04 | StorageClass result"
+      ansible.builtin.debug:
+        msg: "PASS - {{ storageclass.stdout }} exists"
+
+    - name: "05 | Validation complete"
+      ansible.builtin.debug:
+        msg: "Initial checks passed. Checking Ceph OSDs next..."
+
+    - name: "06 | Wait for Ceph OSD pods to become Ready"
+      ansible.builtin.command:
+        argv:
+          - oc
+          - wait
+          - pod
+          - -n
+          - openshift-storage
+          - -l
+          - app=rook-ceph-osd
+          - --for=condition=Ready
+          - --timeout=120s
+      changed_when: false
+
+    - name: "06 | Retrieve Ceph OSD information"
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - pods
+          - -n
+          - openshift-storage
+          - -l
+          - app=rook-ceph-osd
+          - -o
+          - json
+      register: osd_result
+      changed_when: false
+
+    - name: "06 | Parse Ceph OSD information"
+      ansible.builtin.set_fact:
+        osd_pods: "{{ (osd_result.stdout | from_json)['items'] }}"
+
+    - name: "06 | Validate Ceph OSD health and placement"
+      ansible.builtin.assert:
+        that:
+          - osd_pods | length == 3
+          - osd_pods | selectattr('status.phase', 'equalto', 'Running') | list | length == 3
+          - osd_pods | map(attribute='spec.nodeName') | unique | list | length == 3
+        success_msg: "PASS - 3 Ceph OSDs Running and Ready on 3 different nodes"
+        fail_msg: "FAIL - Ceph OSD count, status, or placement is incorrect"

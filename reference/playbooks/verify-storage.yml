@@ -1,0 +1,185 @@
+---
+- name: Verify Ceph provisioning and persistence
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    pod_manifest: |
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: fusion-pvc-test
+        namespace: {{ test_ns }}
+      spec:
+        restartPolicy: Never
+        securityContext:
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+        containers:
+          - name: test
+            image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+            command: ["/bin/sh", "-c", "sleep 3600"]
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop: ["ALL"]
+            volumeMounts:
+              - name: storage
+                mountPath: /data
+        volumes:
+          - name: storage
+            persistentVolumeClaim:
+              claimName: fusion-storage-test
+
+  tasks:
+    - name: Generate a unique test namespace
+      ansible.builtin.set_fact:
+        test_ns: "fusion-test-{{ lookup('pipe', 'date +%s') }}"
+
+    - name: Run storage validation
+      block:
+        - name: "01 | Create test namespace"
+          ansible.builtin.command:
+            argv: [oc, create, namespace, "{{ test_ns }}"]
+
+        - name: "02 | Provision 1 GiB Ceph PVC"
+          ansible.builtin.command:
+            argv: [oc, apply, -f, -]
+            stdin: |
+              apiVersion: v1
+              kind: PersistentVolumeClaim
+              metadata:
+                name: fusion-storage-test
+                namespace: {{ test_ns }}
+              spec:
+                accessModes: [ReadWriteOnce]
+                resources:
+                  requests:
+                    storage: 1Gi
+                storageClassName: ocs-storagecluster-ceph-rbd
+
+        - name: "03 | Wait for PVC to become Bound"
+          ansible.builtin.command:
+            argv:
+              - oc
+              - get
+              - pvc
+              - fusion-storage-test
+              - -n
+              - "{{ test_ns }}"
+              - -o
+              - 'jsonpath={.status.phase}'
+          register: pvc_result
+          until: pvc_result.stdout == "Bound"
+          retries: 36
+          delay: 5
+          changed_when: false
+
+        - name: "03 | PVC provisioned"
+          ansible.builtin.debug:
+            msg: "PASS - Ceph PVC Bound (1 GiB)"
+
+        - name: "04 | Create test Pod"
+          ansible.builtin.command:
+            argv: [oc, apply, -f, -]
+            stdin: "{{ pod_manifest }}"
+
+        - name: "05 | Wait for test Pod"
+          ansible.builtin.command:
+            argv:
+              - oc
+              - wait
+              - pod/fusion-pvc-test
+              - -n
+              - "{{ test_ns }}"
+              - --for=condition=Ready
+              - --timeout=180s
+          changed_when: false
+
+        - name: "06 | Write data to Ceph"
+          ansible.builtin.command:
+            argv:
+              - oc
+              - exec
+              - -n
+              - "{{ test_ns }}"
+              - fusion-pvc-test
+              - --
+              - sh
+              - -c
+              - 'echo "IBM Fusion Persistence Test PASSED" > /data/test.txt'
+
+        - name: "07 | Delete original Pod"
+          ansible.builtin.command:
+            argv:
+              - oc
+              - delete
+              - pod/fusion-pvc-test
+              - -n
+              - "{{ test_ns }}"
+              - --wait=true
+
+        - name: "08 | Recreate Pod with same PVC"
+          ansible.builtin.command:
+            argv: [oc, apply, -f, -]
+            stdin: "{{ pod_manifest }}"
+
+        - name: "09 | Wait for recreated Pod"
+          ansible.builtin.command:
+            argv:
+              - oc
+              - wait
+              - pod/fusion-pvc-test
+              - -n
+              - "{{ test_ns }}"
+              - --for=condition=Ready
+              - --timeout=180s
+          changed_when: false
+
+        - name: "10 | Read original data"
+          ansible.builtin.command:
+            argv:
+              - oc
+              - exec
+              - -n
+              - "{{ test_ns }}"
+              - fusion-pvc-test
+              - --
+              - cat
+              - /data/test.txt
+          register: persistence_result
+          changed_when: false
+
+        - name: "11 | Validate data persistence"
+          ansible.builtin.assert:
+            that:
+              - persistence_result.stdout == "IBM Fusion Persistence Test PASSED"
+            success_msg: "PASS - Data survived Pod deletion and recreation"
+            fail_msg: "FAIL - Persistent data was lost or corrupted"
+
+        - name: "12 | Storage validation complete"
+          ansible.builtin.debug:
+            msg: "PASS - Ceph provisioning and persistence verified"
+
+      always:
+        - name: "CLEANUP | Delete temporary namespace and storage"
+          ansible.builtin.command:
+            argv:
+              - oc
+              - delete
+              - namespace
+              - "{{ test_ns }}"
+              - --ignore-not-found
+              - --wait=true
+              - --timeout=180s
+          register: cleanup_result
+          failed_when: false
+
+        - name: "CLEANUP | Report result"
+          ansible.builtin.debug:
+            msg: >-
+              {{ 'PASS - Test namespace removed'
+                 if cleanup_result.rc == 0
+                 else 'WARNING - Cleanup failed; inspect ' ~ test_ns }}

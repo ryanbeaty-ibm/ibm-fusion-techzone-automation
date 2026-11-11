@@ -1,0 +1,312 @@
+---
+# Phase 4U — TechZone-only, explicit exception for orphaned IBM Fusion InstallPlan.
+# Default READ ONLY. No cluster mutations without separate user-authorized stage.
+# Leaves standard Phase 4N approval strict for ordinary managed OLM installs.
+- name: 'Phase 4U | Review or approve one existing TechZone orphaned IBM Fusion InstallPlan'
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    fusion_namespace: ibm-spectrum-fusion-ns
+    fusion_package: isf-operator
+    fusion_catalog: ibm-operator-catalog
+    expected_fusion_csv: isf-operator.v2.14.1
+    kubeconfig_path: ''
+    expected_api_server: ''
+    protected_api_server: ''
+    approve_techzone_orphan_installplan: false
+    expected_installplan_uid: ''
+    target_installplan_name: ''
+    expected_orphan_subscription_uid: ''
+    techzone_orphan_approval_phrase: ''
+    registry_entitlement_verified: false
+    # One-off TechZone test mode: verify credentials exist, then detect image-pull
+    # errors during real Operator installation. Does NOT attest entitlement.
+    techzone_defer_registry_manifest_check: false
+  tasks:
+    - name: '00 | Require an isolated, explicitly pinned TechZone target'
+      ansible.builtin.assert:
+        that:
+          - install_stage in ['orphan-installplan-audit', 'orphan-installplan-approve']
+          - kubeconfig_path | length > 0
+          - expected_api_server | length > 0
+          - protected_api_server | length > 0
+          - expected_api_server != protected_api_server
+          - expected_api_server is search('\.techzone\.ibm\.com:6443$')
+          - not (operator_phase_apply | default(false) | bool)
+          - not (approve_fusion_installplan | default(false) | bool)
+          - not (initialize_fusion | default(false) | bool)
+          - not (accept_ibm_license | default(false) | bool)
+          - not (install_data_foundation | default(false) | bool)
+          - not (approve_disk_claim | default(false) | bool)
+          - (approve_techzone_orphan_installplan | bool) == (install_stage == 'orphan-installplan-approve')
+          - not (techzone_defer_registry_manifest_check | bool) or (install_stage == 'orphan-installplan-approve')
+          - not (techzone_defer_registry_manifest_check | bool) or not (registry_entitlement_verified | bool)
+        fail_msg: 'BLOCKED - Phase 4U is limited to an explicitly selected TechZone exception with isolated approval'
+
+    - name: '01 | Query the current user on the exact kubeconfig'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami]
+      register: u_user
+      changed_when: false
+
+    - name: '01 | Query the actual API endpoint'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami, --show-server]
+      register: u_api
+      changed_when: false
+
+    - name: '01 | Refuse the protected POC or a changed target'
+      ansible.builtin.assert:
+        that:
+          - u_api.stdout | trim == expected_api_server
+          - u_api.stdout | trim != protected_api_server
+          - u_user.stdout | trim == 'system:admin'
+        fail_msg: 'BLOCKED - Wrong cluster, protected POC, or unexpected identity'
+
+    - name: '02 | Read all namespace Subscriptions'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, subscriptions, -n, '{{ fusion_namespace }}', -o, json]
+      register: u_subs_raw
+      changed_when: false
+
+    - name: '02 | Read all namespace InstallPlans'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, installplans, -n, '{{ fusion_namespace }}', -o, json]
+      register: u_plans_raw
+      changed_when: false
+
+    - name: '02 | Read namespace CSVs'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, csv, -n, '{{ fusion_namespace }}', -o, json]
+      register: u_csvs_raw
+      changed_when: false
+
+    - name: '03 | Prepare inventories without displaying raw InstallPlan JSON'
+      ansible.builtin.set_fact:
+        u_subs: "{{ (u_subs_raw.stdout | from_json)['items'] | default([]) }}"
+        u_plans: "{{ (u_plans_raw.stdout | from_json)['items'] | default([]) }}"
+        u_csvs: "{{ (u_csvs_raw.stdout | from_json)['items'] | default([]) }}"
+
+    - name: '03 | Check there is exactly one unapproved orphan candidate'
+      ansible.builtin.assert:
+        that:
+          - u_subs | length == 0
+          - u_plans | length == 1
+          - u_csvs | length == 0
+          - u_plans[0].metadata.name | default('') | length > 0
+          - u_plans[0].metadata.uid | default('') | length > 0
+          - u_plans[0].spec.approval | default('') == 'Manual'
+          - not (u_plans[0].spec.approved | default(true) | bool)
+          - u_plans[0].status.phase | default('') == 'RequiresApproval'
+          - u_plans[0].spec.clusterServiceVersionNames | default([]) == [expected_fusion_csv]
+          - u_plans[0].metadata.ownerReferences | default([]) | length == 1
+          - u_plans[0].metadata.ownerReferences[0].kind | default('') == 'Subscription'
+          - u_plans[0].metadata.ownerReferences[0].name | default('') == fusion_package
+          - u_plans[0].metadata.ownerReferences[0].uid | default('') | length > 0
+        fail_msg: 'BLOCKED - Not exactly one eligible unapproved TechZone orphaned IBM Fusion plan'
+
+    - name: '03 | Require the IBM catalog and expected bundle in the candidate plan'
+      ansible.builtin.assert:
+        that:
+          - u_plans[0].status.bundleLookups | default([]) | length == 1
+          - u_plans[0].status.bundleLookups[0].identifier | default('') == expected_fusion_csv
+          - u_plans[0].status.bundleLookups[0].catalogSourceRef.name | default('') == fusion_catalog
+          - u_plans[0].status.bundleLookups[0].catalogSourceRef.namespace | default('') == 'openshift-marketplace'
+          - >-
+            (u_plans[0].status.plan | default([]) |
+             selectattr('resource.kind', 'equalto', 'ClusterServiceVersion') |
+             selectattr('resource.name', 'equalto', expected_fusion_csv) |
+             selectattr('resource.sourceName', 'equalto', fusion_catalog) | list | length) == 1
+        fail_msg: 'BLOCKED - Plan bundle or CSV does not belong to the expected IBM catalog'
+
+    - name: '04 | Print only concise approved-for-review identifiers'
+      ansible.builtin.debug:
+        msg:
+          - 'Mode={{ "PENDING EXPLICIT APPROVAL" if approve_techzone_orphan_installplan | bool else "READ-ONLY AUDIT" }}'
+          - 'API={{ u_api.stdout | trim }}; user={{ u_user.stdout | trim }}'
+          - 'Subscription count={{ u_subs | length }}; InstallPlans={{ u_plans | length }}; CSVs={{ u_csvs | length }}'
+          - 'Plan={{ u_plans[0].metadata.name }}; UID={{ u_plans[0].metadata.uid }}'
+          - 'Former Subscription UID={{ u_plans[0].metadata.ownerReferences[0].uid }}'
+          - 'CSV={{ u_plans[0].spec.clusterServiceVersionNames }}; phase={{ u_plans[0].status.phase }}'
+          - 'Manual={{ u_plans[0].spec.approval == "Manual" }}; approved={{ u_plans[0].spec.approved }}'
+          - 'IBM catalog={{ u_plans[0].status.bundleLookups[0].catalogSourceRef.name }}'
+          - 'Registry entitlement separately verified={{ registry_entitlement_verified | bool }}; defer image manifest test={{ techzone_defer_registry_manifest_check | bool }}'
+          - 'TechZone exception only; without Subscription, normal OLM lifecycle/upgrade management is not guaranteed'
+          - 'No writes in audit mode.'
+
+    - name: '05 | Require separate name, immutable UID, original Subscription UID, registry and approval phrase'
+      ansible.builtin.assert:
+        that:
+          - target_installplan_name | length > 0
+          - expected_installplan_uid | length > 0
+          - expected_orphan_subscription_uid | length > 0
+          - target_installplan_name == u_plans[0].metadata.name
+          - expected_installplan_uid == u_plans[0].metadata.uid
+          - expected_orphan_subscription_uid == u_plans[0].metadata.ownerReferences[0].uid
+          - (registry_entitlement_verified | bool) or (techzone_defer_registry_manifest_check | bool)
+          - techzone_orphan_approval_phrase == 'I_APPROVE_ONLY_TECHZONE_ORPHAN_FUSION_OPERATOR'
+        fail_msg: 'BLOCKED - Missing exact three independent pins, registry verification, or explicit approval phrase'
+      when: approve_techzone_orphan_installplan | bool
+
+    - name: '05 | Require patch privilege for this namespace'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', auth, can-i, patch, installplans.operators.coreos.com, -n, '{{ fusion_namespace }}']
+      register: u_patch_privilege
+      changed_when: false
+      when: approve_techzone_orphan_installplan | bool
+
+    - name: '05 | Reject missing patch privilege'
+      ansible.builtin.assert:
+        that:
+          - u_patch_privilege.stdout | trim == 'yes'
+      when: approve_techzone_orphan_installplan | bool
+
+    - name: '06 | Check target cluster global pull secret (no image pull)'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, secret, pull-secret, -n, openshift-config, -o, json]
+      register: u_target_pull_secret
+      changed_when: false
+      no_log: true
+      when: (approve_techzone_orphan_installplan | bool) and (techzone_defer_registry_manifest_check | bool)
+
+    - name: '06 | Parse pull credentials in memory (no output)'
+      ansible.builtin.set_fact:
+        u_auth_entries: "{{ (((u_target_pull_secret.stdout | from_json).data['.dockerconfigjson'] | b64decode | from_json).auths | default({})) | dict2items }}"
+      no_log: true
+      when: (approve_techzone_orphan_installplan | bool) and (techzone_defer_registry_manifest_check | bool)
+
+    - name: '06 | Select only the IBM protected registry entry'
+      ansible.builtin.set_fact:
+        u_cp_auth_entries: "{{ u_auth_entries | selectattr('key', 'match', '^(https?://)?cp\\.icr\\.io/?$') | list }}"
+      no_log: true
+      when: (approve_techzone_orphan_installplan | bool) and (techzone_defer_registry_manifest_check | bool)
+
+    - name: '06 | Require configured IBM credentials (not verified entitlement)'
+      ansible.builtin.assert:
+        that:
+          - u_cp_auth_entries | length == 1
+          - >-
+            (u_cp_auth_entries[0].value.auth | default('') | length > 0)
+            or (u_cp_auth_entries[0].value.identitytoken | default('') | length > 0)
+            or ((u_cp_auth_entries[0].value.username | default('') | length > 0)
+                and (u_cp_auth_entries[0].value.password | default('') | length > 0))
+        success_msg: 'PASS - IBM registry credentials CONFIGURED, not authenticated. Image-pull failures will be assessed after Operator installation.'
+        fail_msg: 'BLOCKED - No usable credential entry for cp.icr.io in target cluster global pull secret.'
+      when: (approve_techzone_orphan_installplan | bool) and (techzone_defer_registry_manifest_check | bool)
+
+    - name: '06 | Declare TechZone test risk transparently'
+      ansible.builtin.debug:
+        msg: 'TECHZONE EXCEPTION - Registry manifest check deferred. Image-pull authorization may fail. This is NOT a verified entitlement.'
+      when: (approve_techzone_orphan_installplan | bool) and (techzone_defer_registry_manifest_check | bool)
+
+    - name: '06 | Independently verify entitled image access before approval'
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ lookup('first_found', [playbook_dir ~ '/../scripts/verify_ibm_registry.py', playbook_dir ~ '/../../scripts/verify_ibm_registry.py']) }}"
+          - --kubeconfig
+          - '{{ kubeconfig_path }}'
+          - --expected-api
+          - '{{ expected_api_server }}'
+          - --protected-api
+          - '{{ protected_api_server | default("") }}'
+          - --image
+          - '{{ registry_probe_image | default("") }}'
+      register: u_registry_probe
+      changed_when: false
+      failed_when: false
+      no_log: true
+      when: (approve_techzone_orphan_installplan | bool) and not (techzone_defer_registry_manifest_check | bool)
+
+    - name: '06 | Reject approval unless private Fusion image manifest was accessible'
+      ansible.builtin.assert:
+        that:
+          - u_registry_probe.rc == 0
+          - (u_registry_probe.stdout | from_json).verified | bool
+        fail_msg: 'BLOCKED - Target cluster registry credentials did not verify against the configured IBM entitled image.'
+      when: (approve_techzone_orphan_installplan | bool) and not (techzone_defer_registry_manifest_check | bool)
+
+    - name: '06 | Recheck all namespace Subscriptions immediately before patch'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, subscriptions, -n, '{{ fusion_namespace }}', -o, json]
+      register: u_latest_subs
+      changed_when: false
+      when: approve_techzone_orphan_installplan | bool
+
+    - name: '06 | Recheck all namespace InstallPlans immediately before patch'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, installplans, -n, '{{ fusion_namespace }}', -o, json]
+      register: u_latest_plans
+      changed_when: false
+      when: approve_techzone_orphan_installplan | bool
+
+    - name: '06 | Reject any Subscription or InstallPlan drift'
+      ansible.builtin.assert:
+        that:
+          - (u_latest_subs.stdout | from_json)['items'] | length == 0
+          - (u_latest_plans.stdout | from_json)['items'] | length == 1
+          - (u_latest_plans.stdout | from_json)['items'][0].metadata.uid == expected_installplan_uid
+          - (u_latest_plans.stdout | from_json)['items'][0].metadata.ownerReferences[0].uid == expected_orphan_subscription_uid
+          - (u_latest_plans.stdout | from_json)['items'][0].spec.approval == 'Manual'
+          - not ((u_latest_plans.stdout | from_json)['items'][0].spec.approved | bool)
+          - (u_latest_plans.stdout | from_json)['items'][0].status.phase == 'RequiresApproval'
+        fail_msg: 'BLOCKED - Plan or Subscription state changed since audit'
+      when: approve_techzone_orphan_installplan | bool
+
+    - name: '07 | Prepare atomic JSON patch with UID, owner and approval state tests'
+      ansible.builtin.set_fact:
+        u_patch:
+          - op: test
+            path: /metadata/uid
+            value: '{{ expected_installplan_uid }}'
+          - op: test
+            path: /metadata/ownerReferences/0/uid
+            value: '{{ expected_orphan_subscription_uid }}'
+          - op: test
+            path: /spec/approval
+            value: Manual
+          - op: test
+            path: /spec/approved
+            value: false
+          - op: replace
+            path: /spec/approved
+            value: true
+      when: approve_techzone_orphan_installplan | bool
+
+    - name: '07 | Approve only the pinned TechZone orphan InstallPlan'
+      ansible.builtin.command:
+        argv:
+          - oc
+          - '--kubeconfig={{ kubeconfig_path }}'
+          - patch
+          - installplan
+          - '{{ target_installplan_name }}'
+          - -n
+          - '{{ fusion_namespace }}'
+          - --type=json
+          - -p
+          - '{{ u_patch | to_json }}'
+      register: u_approval_result
+      changed_when: true
+      when: approve_techzone_orphan_installplan | bool
+
+    - name: '08 | Verify exact InstallPlan approval persisted'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, installplan, '{{ target_installplan_name }}', -n, '{{ fusion_namespace }}', -o, json]
+      register: u_confirmed
+      changed_when: false
+      when: approve_techzone_orphan_installplan | bool
+
+    - name: '08 | Require original plan identity and approved flag'
+      ansible.builtin.assert:
+        that:
+          - (u_confirmed.stdout | from_json).metadata.uid == expected_installplan_uid
+          - (u_confirmed.stdout | from_json).spec.approved | bool
+        success_msg: 'PASS - Exact TechZone orphan plan approved; run operator-ready for asynchronous CSV/Deployment verification'
+      when: approve_techzone_orphan_installplan | bool
+
+    - name: '99 | Finish the isolated TechZone orphan stage'
+      ansible.builtin.debug:
+        msg: '{{ "Approval requested for the exact pinned plan; verify actual Operator readiness separately." if approve_techzone_orphan_installplan | bool else "PASS - One TechZone orphan validated; no cluster changes or InstallPlan approval performed." }}'

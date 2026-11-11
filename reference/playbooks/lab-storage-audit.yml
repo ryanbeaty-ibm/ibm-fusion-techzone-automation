@@ -1,0 +1,173 @@
+---
+# IBM Fusion lab local-storage audit; does not claim/format disks or install ODF.
+# oc debug creates and removes temporary diagnostic pods on the selected nodes.
+- name: 'LAB | Qualify explicitly selected local Ceph disks (no disk writes)'
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    kubeconfig_path: ''
+    expected_api_server: ''
+    protected_api_server: ''
+    odf_storage_nodes: []
+    odf_candidate_device: ''
+    odf_min_disk_bytes: 400000000000
+    odf_require_nonrotational: true
+  tasks:
+    - name: '00 | Require exact API target and explicit node/device selection'
+      ansible.builtin.assert:
+        that:
+          - kubeconfig_path | length > 0
+          - expected_api_server is match('^https://[^/]+:6443$')
+          - expected_api_server != protected_api_server
+          - kubeconfig_path != (lookup('env', 'HOME') ~ '/.kube/config')
+          - odf_storage_nodes | length == 3
+          - odf_storage_nodes | unique | list | length == 3
+          - odf_candidate_device is match('^/dev/[a-zA-Z0-9]+$')
+          - odf_candidate_device not in ['/dev/vda', '/dev/sda', '/dev/nvme0n1']
+          - not (lab_apply | default(false) | bool)
+          - not (approve_disk_claim | default(false) | bool)
+          - not (install_data_foundation | default(false) | bool)
+        fail_msg: 'BLOCKED: This audit requires 3 explicit nodes, disk path and pinned nondefault API. It never writes storage.'
+
+    - name: '00 | Inspect kubeconfig'
+      ansible.builtin.stat:
+        path: '{{ kubeconfig_path }}'
+      register: audit_config
+
+    - name: '00 | Require valid kubeconfig'
+      ansible.builtin.assert:
+        that:
+          - audit_config.stat.isreg | default(false)
+
+    - name: '01 | Resolve actual API'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami, --show-server]
+      register: audit_api
+      changed_when: false
+
+    - name: '01 | Protect all other clusters'
+      ansible.builtin.assert:
+        that:
+          - (audit_api.stdout | trim) == expected_api_server
+          - (audit_api.stdout | trim) != protected_api_server
+        fail_msg: 'BLOCKED: connected API is not the explicitly pinned target.'
+
+    - name: '02 | Read candidate node state'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, node, '{{ item }}', -o, json]
+      loop: '{{ odf_storage_nodes }}'
+      register: audit_nodes
+      changed_when: false
+
+    - name: '02 | Require all selected nodes Ready'
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - >-
+            ((item.stdout | from_json).status.conditions |
+              selectattr('type', 'equalto', 'Ready') |
+              map(attribute='status') | list) == ['True']
+        fail_msg: 'BLOCKED: a selected node is not Ready.'
+      loop: '{{ audit_nodes.results }}'
+      loop_control:
+        label: '{{ item.item }}'
+
+    - name: '03 | Inspect exact selected disks (temporary oc debug pods; no disk writes)'
+      ansible.builtin.command:
+        argv:
+          - oc
+          - '--kubeconfig={{ kubeconfig_path }}'
+          - debug
+          - 'node/{{ item }}'
+          - --
+          - chroot
+          - /host
+          - sh
+          - -ec
+          - >-
+            D={{ odf_candidate_device | quote }};
+            test -b "$D";
+            printf '\n__DISK_BEGIN__\n';
+            lsblk -b -J -o NAME,PATH,TYPE,SIZE,FSTYPE,MOUNTPOINTS,ROTA,RO,MODEL,WWN,SERIAL "$D";
+            printf '\n__DISK_END__\n';
+            printf '__SIGNATURE_BEGIN__\n';
+            wipefs -n "$D";
+            printf '__SIGNATURE_END__\n'
+      loop: '{{ odf_storage_nodes }}'
+      register: audit_disk_probes
+      changed_when: false
+      timeout: 180
+
+    - name: '03 | Ensure complete probe markers exist'
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - "'__DISK_BEGIN__' in item.stdout"
+          - "'__DISK_END__' in item.stdout"
+          - "'__SIGNATURE_BEGIN__' in item.stdout"
+          - "'__SIGNATURE_END__' in item.stdout"
+        fail_msg: 'BLOCKED: incomplete diagnostic output; do not assume disk safety.'
+      loop: '{{ audit_disk_probes.results }}'
+      loop_control:
+        label: '{{ item.item }}'
+
+    - name: '04 | Parse exact device report and filesystem signatures'
+      ansible.builtin.set_fact:
+        audit_disk_reports: >-
+          {{ (audit_disk_reports | default([])) + [{
+            'node': item.item,
+            'devices': ((item.stdout.split('__DISK_BEGIN__')[-1].split('__DISK_END__')[0] | trim | from_json).blockdevices),
+            'signatures': (item.stdout.split('__SIGNATURE_BEGIN__')[-1].split('__SIGNATURE_END__')[0] | trim)
+          }] }}
+      loop: '{{ audit_disk_probes.results }}'
+      loop_control:
+        label: '{{ item.item }}'
+
+    - name: '05 | Verify selected disks are whole, blank, unmounted and correct size/type'
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - item.devices | length == 1
+          - item.devices[0].path == odf_candidate_device
+          - item.devices[0].type == 'disk'
+          - item.devices[0].size | int >= odf_min_disk_bytes | int
+          - item.devices[0].ro | int == 0
+          - item.devices[0].fstype in [none, '']
+          - item.devices[0].children | default([]) | length == 0
+          - item.devices[0].mountpoints | default([]) | select('string') | list | length == 0
+          - item.signatures | length == 0
+        fail_msg: 'BLOCKED: candidate disk is not blank, not large enough, has children/signatures/mounts, or is read-only.'
+      loop: '{{ audit_disk_reports }}'
+      loop_control:
+        label: '{{ item.node }}'
+
+    - name: '05 | Verify disk media reports nonrotational (required for IBM local ODF)'
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - item.devices[0].rota | int == 0
+        fail_msg: >-
+          BLOCKED: {{ item.node }} {{ odf_candidate_device }} reports rotational media.
+          IBM local Data Foundation requires SSD; confirm the TechZone virtual device configuration.
+      when: odf_require_nonrotational | bool
+      loop: '{{ audit_disk_reports }}'
+      loop_control:
+        label: '{{ item.node }}'
+
+    - name: '06 | Report qualified candidates (audit only)'
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.node }} {{ odf_candidate_device }}:
+          {{ (item.devices[0].size | int / 1000000000) | round(1) }} GB,
+          ROTA={{ item.devices[0].rota }}, clean/no mounts/no partitions.
+          CANDIDATE ONLY; no PV/LocalVolumeSet/StorageCluster created.
+      loop: '{{ audit_disk_reports }}'
+      loop_control:
+        label: '{{ item.node }}'
+
+    - name: '99 | Final result'
+      ansible.builtin.debug:
+        msg: >-
+          PASS - Three selected disks qualified on {{ expected_api_server }}.
+          No disks modified. This audit does not prove physical backing SSD or production support.

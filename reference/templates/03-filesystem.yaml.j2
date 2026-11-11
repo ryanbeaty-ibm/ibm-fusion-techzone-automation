@@ -1,0 +1,10 @@
+# DRAFT ONLY. References the PREEXISTING filesystem fs1; does not create a new remote filesystem.
+apiVersion: scale.spectrum.ibm.com/v1beta1
+kind: Filesystem
+metadata:
+  name: {{ scale_name }}-{{ scale_filesystem }}
+  namespace: {{ scale_namespace }}
+spec:
+  remote:
+    cluster: {{ scale_name }}
+    fs: {{ scale_filesystem }}

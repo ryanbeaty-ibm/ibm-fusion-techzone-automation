@@ -1,0 +1,352 @@
+---
+# Phase 4L - IBM Fusion Operator controlled bootstrap
+# DEFAULT: read-only. scenario=empty exercises an offline no-oc path.
+# This playbook never approves an InstallPlan, accepts the IBM license,
+# installs Data Foundation, or creates a LocalVolumeSet / claims disks.
+# A gated operator_phase_apply=true path exists for a separately pinned,
+# freshly audited test cluster, but DO NOT ENABLE until instructed.
+- name: 'Phase 4L | IBM Fusion Operator controlled deployment gate'
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    scenario: ''
+    kubeconfig_path: "{{ lookup('env', 'HOME') }}/.kube/config"
+    expected_api_server: ''
+    operator_phase_apply: false
+    operator_phase_approval: ''
+    registry_entitlement_verified: false
+    dynamic_storage_verified: false
+    expected_ocp_minor: '4.21'
+    expected_fusion_csv: 'isf-operator.v2.14.1'
+    fusion_namespace: ibm-spectrum-fusion-ns
+    fusion_og: isf-og
+    fusion_package: isf-operator
+    fusion_catalog: ibm-operator-catalog
+    fusion_channel: v2.0
+    default_kubeconfig: "{{ lookup('env', 'HOME') }}/.kube/config"
+
+  tasks:
+    - name: '00 | Disallow unreviewed flags and invalid modes'
+      ansible.builtin.assert:
+        that:
+          - scenario in ['', 'empty']
+          - not (deploy | default(false) | bool)
+          - not (install_operators | default(false) | bool)
+          - not (initialize_fusion | default(false) | bool)
+          - not (install_data_foundation | default(false) | bool)
+          - not (approve_disk_claim | default(false) | bool)
+          - not (apply | default(false) | bool)
+          - scenario == '' or not (operator_phase_apply | bool)
+        success_msg: 'PASS - Only explicit Phase 4L Operator-stage authorization is accepted'
+        fail_msg: 'BLOCKED - Unsafe or unsupported deployment flag / scenario'
+
+    - name: '01 | Check specified kubeconfig exists (LIVE only)'
+      ansible.builtin.stat:
+        path: '{{ kubeconfig_path }}'
+      register: l_kubeconfig
+      when: scenario == ''
+
+    - name: '01 | Require a readable, explicit kubeconfig path'
+      ansible.builtin.assert:
+        that:
+          - l_kubeconfig.stat.exists
+          - l_kubeconfig.stat.isreg
+        success_msg: 'PASS - kubeconfig exists'
+        fail_msg: 'BLOCKED - kubeconfig not found: {{ kubeconfig_path }}'
+      when: scenario == ''
+
+    - name: '02 | Identify exact OpenShift target'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami, --show-server]
+      changed_when: false
+      register: l_server
+      when: scenario == ''
+
+    - name: '02 | Check cluster identity'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami]
+      changed_when: false
+      register: l_identity
+      when: scenario == ''
+
+    - name: '02 | Query OpenShift release'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, clusterversion, version, -o, 'jsonpath={.status.desired.version}']
+      register: l_version
+      changed_when: false
+      when: scenario == ''
+
+    - name: '02 | Verify version and optional API pin'
+      ansible.builtin.assert:
+        that:
+          - l_version.stdout is match('^' ~ (expected_ocp_minor | regex_escape) ~ '[.]')
+          - expected_api_server == '' or (l_server.stdout | trim) == (expected_api_server | trim)
+        success_msg: 'PASS - OpenShift version and optional server binding checked'
+        fail_msg: 'BLOCKED - Unexpected OCP version or API endpoint'
+      when: scenario == ''
+
+    - name: '03 | Inspect IBM catalog source'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, catalogsource, '{{ fusion_catalog }}', -n, openshift-marketplace, -o, json, --ignore-not-found]
+      changed_when: false
+      register: l_catalog
+      when: scenario == ''
+
+    - name: '03 | Inspect IBM Fusion package metadata'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, packagemanifest, '{{ fusion_package }}', -n, openshift-marketplace, -o, json, --ignore-not-found]
+      changed_when: false
+      register: l_package
+      when: scenario == ''
+
+    - name: '03 | Inspect current Fusion namespace'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, namespace, '{{ fusion_namespace }}', -o, json, --ignore-not-found]
+      changed_when: false
+      register: l_namespace
+      when: scenario == ''
+
+    - name: '03 | Inspect all OperatorGroups'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, operatorgroups, -A, -o, json]
+      changed_when: false
+      register: l_groups
+      when: scenario == ''
+
+    - name: '03 | Inspect all Subscriptions'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, subscriptions, -A, -o, json]
+      changed_when: false
+      register: l_subs
+      when: scenario == ''
+
+    - name: '03 | Inspect all InstallPlans (including those with missing Subscriptions)'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, installplans, -A, -o, json]
+      changed_when: false
+      register: l_plans
+      when: scenario == ''
+
+    - name: '03 | Inspect all installed CSVs'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, csv, -A, -o, json]
+      changed_when: false
+      register: l_csvs
+      when: scenario == ''
+
+    - name: '04 | Build concise, read-only Operator inventory'
+      ansible.builtin.set_fact:
+        l_catalog_exists: "{{ l_catalog.stdout | trim | length > 0 }}"
+        l_namespace_exists: "{{ l_namespace.stdout | trim | length > 0 }}"
+        l_pkg_exists: "{{ l_package.stdout | trim | length > 0 }}"
+        l_package_info: "{{ (l_package.stdout | from_json) if (l_package.stdout | trim | length > 0) else {} }}"
+        l_fusion_groups: >-
+          {{ (l_groups.stdout | from_json)['items'] |
+             selectattr('metadata.namespace', 'equalto', fusion_namespace) | list }}
+        l_fusion_subs: >-
+          {{ (l_subs.stdout | from_json)['items'] |
+             selectattr('spec.name', 'defined') |
+             selectattr('spec.name', 'equalto', fusion_package) | list }}
+        l_fusion_installplans: >-
+          {{ (l_plans.stdout | from_json)['items'] |
+             selectattr('metadata.namespace', 'equalto', fusion_namespace) | list }}
+        l_fusion_csvs: >-
+          {{ (l_csvs.stdout | from_json)['items'] |
+             selectattr('metadata.name', 'match', '^isf-operator[.]') | list }}
+      when: scenario == ''
+
+    - name: '04 | Check candidate package version and existing scope'
+      ansible.builtin.set_fact:
+        l_catalog_correct: >-
+          {{ l_pkg_exists and (l_package_info.status.catalogSource | default('')) == fusion_catalog }}
+        l_package_csv: >-
+          {{ (l_package_info.status.channels | default([]) |
+              selectattr('name', 'equalto', fusion_channel) |
+              map(attribute='currentCSV') | first | default('')) if l_pkg_exists else '' }}
+        l_operator_installed: >-
+          {{ (l_fusion_csvs | selectattr('metadata.namespace', 'equalto', fusion_namespace) |
+              selectattr('status.phase', 'defined') |
+              selectattr('status.phase', 'equalto', 'Succeeded') | list | length) > 0 }}
+        l_scope_safe: >-
+          {{ (l_fusion_groups | length) == 0 or
+             ((l_fusion_groups | length) == 1 and
+              (l_fusion_groups[0].spec.targetNamespaces | default([])) == [fusion_namespace]) }}
+      when: scenario == ''
+
+    - name: '05 | Show live Operator readiness without changing anything'
+      ansible.builtin.debug:
+        msg:
+          - 'Mode=LIVE; ACTION={{ "ARMED FOR WRITE" if operator_phase_apply | bool else "AUDIT ONLY" }}'
+          - 'Target={{ l_server.stdout }}; login={{ l_identity.stdout }}; version={{ l_version.stdout }}'
+          - 'Kubeconfig={{ kubeconfig_path }}; pin={{ "VERIFIED" if expected_api_server != "" else "NOT SUPPLIED" }}'
+          - 'IBM CatalogSource exists={{ l_catalog_exists }}'
+          - 'Fusion package exists={{ l_pkg_exists }}; correct catalog={{ l_catalog_correct }}'
+          - 'Channel={{ fusion_channel }}; current catalog CSV={{ l_package_csv or "NOT FOUND" }}; expected={{ expected_fusion_csv }}'
+          - 'Namespace exists={{ l_namespace_exists }}; OperatorGroups={{ l_fusion_groups | length }}; Subscriptions for Fusion={{ l_fusion_subs | length }}'
+          - 'Successful IBM Fusion Operator CSV={{ l_operator_installed }}; total matching CSVs={{ l_fusion_csvs | length }}'
+          - 'Existing InstallPlans in Fusion namespace={{ l_fusion_installplans | length }} (will block new bootstrap even if Subscription is missing)'
+          - 'Next step={{ "NO OPERATOR INSTALL NEEDED" if l_operator_installed else ("REVIEW MISSING CATALOG/PACKAGE" if not (l_catalog_exists and l_pkg_exists) else ("BLOCKED - conflicting OLM resources" if (l_fusion_subs | length > 0 or l_fusion_csvs | length > 0 or not l_scope_safe) else "REVIEW PREREQUISITES AND MANUAL INSTALLPLAN")) }}'
+          - 'No InstallPlan will be approved. No license, Data Foundation or disks will be modified.'
+      when: scenario == ''
+
+    - name: '05 | Simulate an empty OpenShift cluster (no oc calls)'
+      ansible.builtin.debug:
+        msg:
+          - 'Mode=OFFLINE SIMULATION; Cluster=empty'
+          - 'Expected installation steps: verify registry/catalog, create Fusion Namespace, create scoped OperatorGroup, create Manual Subscription'
+          - 'Stop before approving any InstallPlan; inspect target CSV and plan manually'
+          - 'No cluster calls or changes performed'
+      when: scenario == 'empty'
+
+    - name: '06 | Guard all write steps with cluster pin and independent approvals'
+      ansible.builtin.assert:
+        that:
+          - scenario == ''
+          - operator_phase_approval == 'I_APPROVE_FUSION_OPERATOR_BOOTSTRAP'
+          - expected_api_server | length > 0
+          - l_server.stdout | trim == expected_api_server | trim
+          - kubeconfig_path != default_kubeconfig
+          # Creating a Manual Subscription does not approve an InstallPlan or pull
+          # IBM images. Entitlement and RWO capacity are checked at later gates.
+          - not l_operator_installed
+          - l_namespace_exists or (l_fusion_groups | length) == 0
+          - l_scope_safe
+          - (l_fusion_subs | length) == 0
+          - (l_fusion_installplans | length) == 0
+          - (l_fusion_csvs | length) == 0
+          - l_catalog_exists
+          - l_catalog_correct
+          - l_pkg_exists
+          - l_package_csv == expected_fusion_csv
+        success_msg: 'PASS - Explicitly approved bootstrap of one IBM Fusion Operator on pinned new cluster'
+        fail_msg: >-
+          BLOCKED - Wrong cluster, incomplete OLM/catalog prerequisites, existing
+          Operator resources / existing InstallPlans (including orphaned ones),
+          incorrect target CSV, or explicit approval missing.
+          No writes executed by this task.
+      when: operator_phase_apply | bool
+
+    - name: '06 | Verify privilege to create bootstrap resources'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', auth, can-i, create, '{{ item.resource }}', '{{ item.scope }}']
+      loop:
+        - { resource: namespaces, scope: '--all-namespaces' }
+        - { resource: operatorgroups.operators.coreos.com, scope: '--namespace=ibm-spectrum-fusion-ns' }
+        - { resource: subscriptions.operators.coreos.com, scope: '--namespace=ibm-spectrum-fusion-ns' }
+      loop_control:
+        label: '{{ item.resource }}'
+      register: l_permissions
+      changed_when: false
+      when: operator_phase_apply | bool
+
+    - name: '06 | Require permission checks to return yes'
+      ansible.builtin.assert:
+        that:
+          - item.stdout | trim == 'yes'
+        fail_msg: 'BLOCKED - Cannot create {{ item.item.resource }}'
+      loop: '{{ l_permissions.results }}'
+      loop_control:
+        label: '{{ item.item.resource }}'
+      when: operator_phase_apply | bool
+
+    - name: '07 | Create Fusion namespace only if absent'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', create, -f, -]
+        stdin: |
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: {{ fusion_namespace }}
+      when:
+        - operator_phase_apply | bool
+        - not l_namespace_exists
+      changed_when: true
+
+    - name: '08 | Create scoped Fusion OperatorGroup only if absent'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', create, -f, -]
+        stdin: |
+          apiVersion: operators.coreos.com/v1
+          kind: OperatorGroup
+          metadata:
+            name: {{ fusion_og }}
+            namespace: {{ fusion_namespace }}
+          spec:
+            targetNamespaces:
+              - {{ fusion_namespace }}
+            upgradeStrategy: Default
+      when:
+        - operator_phase_apply | bool
+        - (l_fusion_groups | length) == 0
+      changed_when: true
+
+    - name: '09 | Create IBM Fusion Subscription with Manual InstallPlan approval'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', create, -f, -, -o, json]
+        stdin: |
+          apiVersion: operators.coreos.com/v1alpha1
+          kind: Subscription
+          metadata:
+            name: {{ fusion_package }}
+            namespace: {{ fusion_namespace }}
+          spec:
+            channel: {{ fusion_channel }}
+            name: {{ fusion_package }}
+            source: {{ fusion_catalog }}
+            sourceNamespace: openshift-marketplace
+            installPlanApproval: Manual
+      when: operator_phase_apply | bool
+      changed_when: true
+      register: l_created_subscription
+
+    - name: '09 | Check Subscription immediately after creation'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, subscription, '{{ fusion_package }}', -n, '{{ fusion_namespace }}', -o, json, --ignore-not-found]
+      changed_when: false
+      register: l_subscription_readback
+      when: operator_phase_apply | bool
+
+    - name: '09 | Verify created Subscription persists with the original UID and Manual policy'
+      ansible.builtin.assert:
+        that:
+          - (l_created_subscription.stdout | from_json).metadata.uid | length > 0
+          - l_subscription_readback.stdout | trim | length > 0
+          - (l_subscription_readback.stdout | from_json).metadata.uid == (l_created_subscription.stdout | from_json).metadata.uid
+          - (l_subscription_readback.stdout | from_json).spec.installPlanApproval == 'Manual'
+          - (l_subscription_readback.stdout | from_json).spec.name == fusion_package
+        success_msg: 'PASS - Created Subscription exists with matching UID and Manual approval'
+        fail_msg: 'BLOCKED - Subscription disappeared or changed after creation. Do NOT approve or rerun bootstrap; inspect orphaned InstallPlans.'
+      when: operator_phase_apply | bool
+
+    - name: '10 | Display InstallPlans for separate manual review (no approval performed)'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, installplans, -n, '{{ fusion_namespace }}', -o, wide]
+      register: l_installplans
+      changed_when: false
+      when: operator_phase_apply | bool
+
+    - name: '10 | Re-read created Subscription after checking InstallPlans'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, subscription, '{{ fusion_package }}', -n, '{{ fusion_namespace }}', -o, json, --ignore-not-found]
+      register: l_subscription_final
+      changed_when: false
+      when: operator_phase_apply | bool
+
+    - name: '10 | Fail closed if Subscription vanished after OLM reconciliation'
+      ansible.builtin.assert:
+        that:
+          - l_subscription_final.stdout | trim | length > 0
+          - (l_subscription_final.stdout | from_json).metadata.uid == (l_created_subscription.stdout | from_json).metadata.uid
+          - (l_subscription_final.stdout | from_json).spec.installPlanApproval == 'Manual'
+        fail_msg: 'BLOCKED - Newly created Subscription is missing or changed. An InstallPlan may remain orphaned. Do NOT retry bootstrap or approve.'
+        success_msg: 'PASS - Subscription retained its UID and Manual policy after InstallPlan query'
+      when: operator_phase_apply | bool
+
+    - name: '99 | Finish Phase 4L'
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'OPERATOR SUBSCRIPTION CREATED. STOP: manually inspect InstallPlans and CSV before approval.'
+             if operator_phase_apply | bool else
+             'PASS - Phase 4L audit/simulation finished; no cluster resources modified.' }}

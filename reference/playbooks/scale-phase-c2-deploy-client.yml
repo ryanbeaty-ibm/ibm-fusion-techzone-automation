@@ -1,0 +1,148 @@
+---
+- name: IBM Fusion Scale v1.1 | Phase C2 | Deploy isolated local Scale client cluster
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    scale_namespace: ibm-spectrum-scale
+    scale_cluster_name: ibm-spectrum-scale
+    scale_controller_name: ibm-spectrum-scale-controller-manager
+    scale_cluster_manifest: "{{ playbook_dir }}/../build/scale-v1.1/01-cluster.yaml"
+    scale_wait_retries: 240
+    scale_wait_delay: 10
+  tasks:
+    - name: Require explicit Lab 2 approval and exact three worker selection
+      ansible.builtin.assert:
+        that:
+          - kubeconfig == '/home/automation/.kube/techzone-2.conf'
+          - scale_apply_enabled | default(false) | bool
+          - (scale_nodes | sort) == (['itz-d4xrcs-worker-1', 'itz-d4xrcs-worker-2', 'itz-d4xrcs-worker-3'] | sort)
+        fail_msg: 'Phase C2 is only permitted for the three selected Lab 2 workers.'
+
+    - name: Read only the locally rendered Cluster manifest
+      ansible.builtin.set_fact:
+        desired_cluster: "{{ lookup('ansible.builtin.file', scale_cluster_manifest) | from_yaml }}"
+
+    - name: Validate exact Cluster manifest, license, and node isolation
+      ansible.builtin.assert:
+        that:
+          - desired_cluster['apiVersion'] == 'scale.spectrum.ibm.com/v1beta1'
+          - desired_cluster['kind'] == 'Cluster'
+          - desired_cluster['metadata']['name'] == scale_cluster_name
+          - desired_cluster['metadata']['namespace'] == scale_namespace
+          - desired_cluster['spec']['license']['accept'] | bool
+          - desired_cluster['spec']['license']['license'] == 'data-access'
+          - >-
+            desired_cluster['spec']['daemon']['nodeSelector'] == {'node-role.kubernetes.io/scale': ''}
+        fail_msg: 'Rendered Cluster manifest differs from the approved Lab 2 configuration; refusing to apply.'
+
+    - name: Inspect all nodes with the dedicated Scale role
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', get, nodes, -l, 'node-role.kubernetes.io/scale', -o, json]
+      register: scale_nodes_raw
+      changed_when: false
+
+    - name: Verify exactly the intended three nodes are labeled Scale
+      ansible.builtin.assert:
+        that:
+          - ((scale_nodes_raw.stdout | from_json)['items'] | map(attribute='metadata.name') | sort | list) == (scale_nodes | sort)
+        fail_msg: 'Scale role labels do not match the three designated non-Ceph workers.'
+
+    - name: Inspect Scale machine configuration pool
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', get, mcp, scale, -o, json]
+      register: mcp_raw
+      changed_when: false
+
+    - name: Verify Scale kernel preparation completed
+      ansible.builtin.assert:
+        that:
+          - ((mcp_raw.stdout | from_json)['status']['machineCount'] | int) == 3
+          - ((mcp_raw.stdout | from_json)['status']['readyMachineCount'] | int) == 3
+          - ((mcp_raw.stdout | from_json)['status']['updatedMachineCount'] | int) == 3
+          - ((mcp_raw.stdout | from_json)['status']['degradedMachineCount'] | int) == 0
+        fail_msg: 'Scale machine configuration pool is not fully updated and ready.'
+
+    - name: Confirm existing Ceph StorageCluster remains present
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, openshift-storage, get, storagecluster, -o, json]
+      register: ceph_raw
+      changed_when: false
+
+    - name: Refuse deployment if Ceph storage is missing
+      ansible.builtin.assert:
+        that:
+          - ((ceph_raw.stdout | from_json)['items'] | length) >= 1
+
+    - name: Check active Scale Operator deployment
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, '{{ scale_namespace }}', get, deploy, '{{ scale_controller_name }}', -o, json]
+      register: controller_raw
+      changed_when: false
+
+    - name: Require at least one healthy Scale Operator replica
+      ansible.builtin.assert:
+        that:
+          - ((controller_raw.stdout | from_json)['status']['readyReplicas'] | default(0) | int) >= 1
+        fail_msg: 'Scale Operator not Ready; run/inspect Phase C1 first.'
+
+    - name: Inspect existing Scale Cluster objects
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, '{{ scale_namespace }}', get, clusters.scale.spectrum.ibm.com, -o, json]
+      register: existing_clusters_raw
+      changed_when: false
+
+    - name: Reject conflicting existing Scale Cluster configuration
+      ansible.builtin.assert:
+        that:
+          - ((existing_clusters_raw.stdout | from_json)['items'] | length) <= 1
+          - >-
+            ((existing_clusters_raw.stdout | from_json)['items'] | length) == 0 or
+            ((existing_clusters_raw.stdout | from_json)['items'][0]['metadata']['name'] == scale_cluster_name and
+             (existing_clusters_raw.stdout | from_json)['items'][0]['spec']['daemon']['nodeSelector'] == {'node-role.kubernetes.io/scale': ''})
+        fail_msg: 'Conflicting Cluster object already exists; refusing to overwrite it.'
+
+    - name: Server-side validate ONLY the Cluster resource
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, '{{ scale_namespace }}', apply, '--dry-run=server', '--validate=strict', -f, '{{ scale_cluster_manifest }}']
+      changed_when: false
+
+    - name: Apply ONLY the Scale client Cluster resource (no RemoteCluster, Filesystem or StorageClass)
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, '{{ scale_namespace }}', apply, -f, '{{ scale_cluster_manifest }}']
+      register: cluster_apply
+      changed_when: "' created' in cluster_apply.stdout or ' configured' in cluster_apply.stdout"
+
+    - name: Wait for exactly three Ready Scale core pods (up to 40 minutes by default)
+      ansible.builtin.shell: |
+        set -o pipefail
+        oc --kubeconfig='{{ kubeconfig }}' -n '{{ scale_namespace }}' \
+          get pods -l app.kubernetes.io/name=core -o json |
+          jq -r '"core=\(.items|length) ready=\([.items[] | select(any(.status.conditions[]?; .type=="Ready" and .status=="True"))]|length)"'
+      args:
+        executable: /bin/bash
+      register: core_poll
+      until: core_poll.rc == 0 and core_poll.stdout == 'core=3 ready=3'
+      retries: '{{ scale_wait_retries | int }}'
+      delay: '{{ scale_wait_delay | int }}'
+      changed_when: false
+
+    - name: Inspect core pod placements after readiness
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, '{{ scale_namespace }}', get, pods, -l, 'app.kubernetes.io/name=core', -o, json]
+      register: core_placements_raw
+      changed_when: false
+
+    - name: Assert Scale core pods run only on intended workers
+      ansible.builtin.assert:
+        that:
+          - ((core_placements_raw.stdout | from_json)['items'] | map(attribute='spec.nodeName') | sort | list) == (scale_nodes | sort)
+        fail_msg: 'Scale core pod placement does not match the approved worker list.'
+
+    - name: Summarize successful local cluster deployment
+      ansible.builtin.debug:
+        msg:
+          - 'PHASE C2 PASS: exactly 3 IBM Storage Scale core pods are Ready on the selected workers.'
+          - 'This playbook applied ONLY build/scale-v1.1/01-cluster.yaml.'
+          - 'RemoteCluster, GUI Secret, filesystem fs1, and StorageClass have NOT been applied.'
+          - 'No Ceph StorageCluster or Ceph MachineConfigPool modifications were requested.'

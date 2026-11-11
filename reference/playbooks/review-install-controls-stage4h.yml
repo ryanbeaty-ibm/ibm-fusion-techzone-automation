@@ -1,0 +1,98 @@
+---
+# Phase 4H - IBM Fusion execution safety contract
+# This playbook is deliberately READ ONLY. It never installs software,
+# creates manifests, writes files, patches resources, or claims devices.
+# Its purpose is to verify safety defaults and exercise rejection gates.
+- name: "Phase 4H | Review cluster binding and installation safety controls"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    scenario: ""                        # ""=live; "empty"=offline test
+    expected_api_server: ""             # Bind explicitly before a future deployment
+    operator_installplan_approval: Manual
+    minimum_disk_size_gib: 499
+    max_devices_per_node: 1
+    required_storage_nodes: 3
+    selected_storage_nodes: []           # Future user-reviewed node names
+    registry_entitlement_verified: false # A Secret's existence alone is insufficient
+    dynamic_storage_verified: false      # Validate IBM's version-specific prereqs
+    fusion_license_acknowledged: false   # Must be a deliberate decision
+    disk_claim_approved: false           # Must be a separate deliberate decision
+
+  tasks:
+    - name: "00 | Block every known deployment or write-capable option"
+      ansible.builtin.assert:
+        that:
+          - scenario in ['', 'empty']
+          - not (deploy | default(false) | bool)
+          - not (apply | default(false) | bool)
+          - not (install_operators | default(false) | bool)
+          - not (initialize_fusion | default(false) | bool)
+          - not (install_data_foundation | default(false) | bool)
+          - not (generate_manifest | default(false) | bool)
+          - not (approve_disk_claim | default(false) | bool)
+          - not (run_persistence_test | default(false) | bool)
+        success_msg: "PASS - Read-only execution enforced"
+        fail_msg: "BLOCKED - Write-capable flags are forbidden in this review playbook"
+
+    - name: "01 | Validate operator upgrade and disk selection policy"
+      ansible.builtin.assert:
+        that:
+          - operator_installplan_approval == 'Manual'
+          - (minimum_disk_size_gib | int) >= 499
+          - (max_devices_per_node | int) == 1
+          - (required_storage_nodes | int) == 3
+          - selected_storage_nodes is sequence
+          - selected_storage_nodes is not string
+          - (selected_storage_nodes | length) in [0, 3]
+          - (selected_storage_nodes | unique | list | length) == (selected_storage_nodes | length)
+        success_msg: "PASS - Manual OLM approval, conservative disk policy, and node selection are consistent"
+        fail_msg: "BLOCKED - Unsafe upgrade, disk, or node-selection settings"
+
+    - name: "02 | Read current OpenShift identity (live only)"
+      ansible.builtin.command:
+        argv: [oc, whoami]
+      register: h_identity
+      changed_when: false
+      when: scenario == ''
+
+    - name: "02 | Read OpenShift API endpoint (live only)"
+      ansible.builtin.command:
+        argv: [oc, whoami, --show-server]
+      register: h_api
+      changed_when: false
+      when: scenario == ''
+
+    - name: "03 | Reject a mismatch if an expected API endpoint is supplied"
+      ansible.builtin.assert:
+        that:
+          - expected_api_server == '' or (h_api.stdout | trim) == (expected_api_server | trim)
+        success_msg: "PASS - Cluster endpoint matches expected target, or binding is not yet provided"
+        fail_msg: "BLOCKED - Connected API server differs from expected_api_server"
+      when: scenario == ''
+
+    - name: "04 | Report live cluster binding and predeployment blockers"
+      ansible.builtin.debug:
+        msg:
+          - "Mode={{ 'SIMULATION (no oc calls)' if scenario == 'empty' else 'LIVE READ-ONLY' }}"
+          - "Identity={{ h_identity.stdout if scenario == '' else 'not queried' }}"
+          - "API server={{ h_api.stdout if scenario == '' else 'not queried' }}"
+          - "Cluster pin={{ 'NOT VERIFIED: supply expected_api_server before future deployment' if expected_api_server == '' else ('verified' if scenario == '' else 'not checked in simulation') }}"
+          - "Operator InstallPlan approval={{ operator_installplan_approval }}"
+          - "Registry entitlement={{ 'user-marked verified; not probed by playbook' if registry_entitlement_verified | bool else 'REVIEW REQUIRED' }}"
+          - "Dynamic storage prerequisite={{ 'user-marked verified; not probed by playbook' if dynamic_storage_verified | bool else 'REVIEW REQUIRED' }}"
+          - "IBM license acceptance={{ 'user acknowledged; no resource changed' if fusion_license_acknowledged | bool else 'REVIEW REQUIRED before initialization' }}"
+          - "Selected disk nodes={{ selected_storage_nodes | length }}/{{ required_storage_nodes }}"
+          - "Disk approval={{ 'user acknowledged; independent safety checks still required' if disk_claim_approved | bool else 'BLOCKED pending review' }}"
+          - "Minimum device capacity={{ minimum_disk_size_gib }} GiB; max per node={{ max_devices_per_node }}"
+          - "SAFE: No manifests generated, no resources changed, no disks touched."
+
+    - name: "99 | Confirm all approvals are informational in this stage"
+      ansible.builtin.debug:
+        msg: >-
+          PASS - Phase 4H safety review finished. This playbook contains NO
+          write tasks, even if approval booleans are provided. Future deployment
+          must implement separate per-stage authorization, a pinned cluster endpoint,
+          verified entitlement and storage capacity, and a second disk inventory check.

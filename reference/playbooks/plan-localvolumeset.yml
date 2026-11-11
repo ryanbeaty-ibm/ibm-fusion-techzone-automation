@@ -1,0 +1,235 @@
+---
+# IBM Storage Fusion / Data Foundation - Phase 4C
+# Safe LocalVolumeSet planning. NO 'oc apply', 'oc create', or disk writes.
+# Default: inventory ONLY, including read-only cluster API calls.
+# Optional: generate_manifest=true + exactly three selected_nodes will write
+# a LOCAL manifest for manual review, never apply it to OpenShift.
+- name: Phase 4C - Audit and plan local Ceph disk selection (never apply)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    min_disk_size_gib: 499
+    bytes_per_gib: 1073741824
+    proposed_storage_class: fusion-ceph-local
+    proposed_set_name: fusion-ceph-disks
+    local_storage_namespace: openshift-local-storage
+    generate_manifest: false
+    selected_nodes: []
+    plan_path: "{{ playbook_dir }}/../plans/localvolumeset-review.yaml"
+
+  tasks:
+    - name: "01 | Confirm OpenShift authentication"
+      ansible.builtin.command:
+        argv: [oc, whoami]
+      changed_when: false
+
+    - name: "02 | Read discovery results"
+      ansible.builtin.command:
+        argv: [oc, get, localvolumediscoveryresults, --all-namespaces, -o, json]
+      register: discovered
+      changed_when: false
+
+    - name: "02 | Read cluster node labels and readiness"
+      ansible.builtin.command:
+        argv: [oc, get, nodes, -o, json]
+      register: node_output
+      changed_when: false
+
+    - name: "02 | Read existing LocalVolumeSets"
+      ansible.builtin.command:
+        argv: [oc, get, localvolumesets, --all-namespaces, -o, json]
+      register: sets_output
+      changed_when: false
+
+    - name: "02 | Read existing persistent volumes"
+      ansible.builtin.command:
+        argv: [oc, get, pv, -o, json]
+      register: pvs_output
+      changed_when: false
+
+    - name: "02 | Read existing StorageClasses"
+      ansible.builtin.command:
+        argv: [oc, get, storageclasses, -o, json]
+      register: classes_output
+      changed_when: false
+
+    - name: "03 | Parse inventories"
+      ansible.builtin.set_fact:
+        discovered_data: "{{ discovered.stdout | from_json }}"
+        node_data: "{{ node_output.stdout | from_json }}"
+        sets_data: "{{ sets_output.stdout | from_json }}"
+        pvs_data: "{{ pvs_output.stdout | from_json }}"
+        classes_data: "{{ classes_output.stdout | from_json }}"
+
+    - name: "03 | Require discovery results"
+      ansible.builtin.assert:
+        that:
+          - "(discovered_data['items'] | length) > 0"
+        success_msg: "PASS - Discovery reports for {{ discovered_data['items'] | length }} nodes"
+        fail_msg: "STOP - No discovery results. Set up the Local Storage discovery process before planning."
+
+    - name: "04 | Evaluate non-zero-size disks (conservative filter)"
+      ansible.builtin.set_fact:
+        report_json: |-
+          {% set ns = namespace(rows=[]) %}
+          {% for result in discovered_data['items'] %}
+          {% set node = result.get('spec', {}).get('nodeName', 'UNKNOWN') %}
+          {% for dev in result.get('status', {}).get('discoveredDevices', []) %}
+          {% set size_bytes = dev.get('size', 0) | int %}
+          {% if dev.get('type', '') == 'disk' and size_bytes > 0 %}
+          {% set path = dev.get('path', '') %}
+          {% set state = dev.get('status', {}).get('state', 'Unknown') %}
+          {% set fs = dev.get('fstype', '') %}
+          {% if state != 'Available' %}
+          {% set decision = 'EXCLUDE: unavailable/in use' %}
+          {% elif fs | length > 0 %}
+          {% set decision = 'EXCLUDE: filesystem signature' %}
+          {% elif size_bytes < (min_disk_size_gib | int) * (bytes_per_gib | int) %}
+          {% set decision = 'EXCLUDE: too small' %}
+          {% elif dev.get('property', '') != 'NonRotational' %}
+          {% set decision = 'EXCLUDE: not nonrotational' %}
+          {% elif path is not match('^/dev/(?!nbd|rbd|loop|ram|zram|dm-)[A-Za-z0-9_-]+$') %}
+          {% set decision = 'EXCLUDE: unsupported device path' %}
+          {% else %}
+          {% set decision = 'CANDIDATE' %}
+          {% endif %}
+          {% set ns.rows = ns.rows + [{'node': node, 'path': path, 'size_gib': ((size_bytes / (bytes_per_gib | int)) | round(1)), 'decision': decision}] %}
+          {% endif %}
+          {% endfor %}
+          {% endfor %}
+          {{ ns.rows | to_json }}
+
+    - name: "04 | Parse disk report"
+      ansible.builtin.set_fact:
+        disk_report: "{{ report_json | from_json }}"
+
+    - name: "05 | Summarize protected existing storage and disk candidates"
+      ansible.builtin.debug:
+        msg:
+          - "Existing LocalVolumeSets: {{ sets_data['items'] | length }}; existing PVs: {{ pvs_data['items'] | length }}"
+          - "PVs using {{ proposed_storage_class }}: {{ pvs_data['items'] | selectattr('spec.storageClassName', 'defined') | selectattr('spec.storageClassName', 'equalto', proposed_storage_class) | list | length }}"
+          - "Examined non-zero-size disks: {{ disk_report | length }} across {{ discovered_data['items'] | length }} nodes"
+          - "Disk candidates (NOT verified safe): {{ disk_report | selectattr('decision', 'equalto', 'CANDIDATE') | list | length }}"
+          - "This playbook never creates/updates a LocalVolumeSet or modifies devices."
+
+    - name: "05 | Display candidate disks only"
+      ansible.builtin.debug:
+        msg: "REVIEW - {{ item.node }} {{ item.path }} ({{ item.size_gib }} GiB)"
+      loop: "{{ disk_report | selectattr('decision', 'equalto', 'CANDIDATE') | list }}"
+      loop_control:
+        label: "{{ item.node }} {{ item.path }}"
+
+    - name: "06 | Ensure manifest generation is explicitly requested"
+      ansible.builtin.debug:
+        msg: >-
+          READ-ONLY COMPLETE. No manifest generated. To generate a local review manifest
+          on a fresh cluster, explicitly supply generate_manifest=true and three selected_nodes.
+          This does NOT authorize a disk claim.
+      when: not (generate_manifest | bool)
+
+    - name: "07 | Guarded manifest generation (LOCAL FILE ONLY)"
+      when: generate_manifest | bool
+      block:
+        - name: "07 | Require exactly three unique, explicitly selected nodes"
+          ansible.builtin.assert:
+            that:
+              - "(selected_nodes | length) == 3"
+              - "(selected_nodes | unique | list | length) == 3"
+              - "(selected_nodes | difference(node_data['items'] | map(attribute='metadata.name') | list) | length) == 0"
+              - "(sets_data['items'] | selectattr('metadata.name', 'equalto', proposed_set_name) | selectattr('metadata.namespace', 'equalto', local_storage_namespace) | list | length) == 0"
+              - "(sets_data['items'] | selectattr('spec.storageClassName', 'defined') | selectattr('spec.storageClassName', 'equalto', proposed_storage_class) | list | length) == 0"
+              - "(pvs_data['items'] | selectattr('spec.storageClassName', 'defined') | selectattr('spec.storageClassName', 'equalto', proposed_storage_class) | list | length) == 0"
+              - "(classes_data['items'] | selectattr('metadata.name', 'equalto', proposed_storage_class) | list | length) == 0"
+            fail_msg: >-
+              STOP - Select three unique existing nodes and use a fresh storage class/set.
+              Existing LocalVolumeSets, PVs, and StorageClasses must not be overwritten or repurposed.
+            success_msg: "PASS - Three distinct nodes selected; no existing target class/set detected"
+
+        - name: "07 | Require exactly one eligible disk per selected node"
+          ansible.builtin.assert:
+            that:
+              - "(disk_report | selectattr('node', 'equalto', item) | selectattr('decision', 'equalto', 'CANDIDATE') | list | length) == 1"
+            fail_msg: >-
+              STOP - {{ item }} does not have exactly one unused disk matching the conservative
+              criteria. A LocalVolumeSet selects by class/size, NOT exact path.
+            success_msg: "PASS - {{ item }} has exactly one preliminary disk candidate"
+          loop: "{{ selected_nodes }}"
+
+        - name: "07 | Validate selected nodes are Ready and have hostname labels"
+          ansible.builtin.assert:
+            that:
+              - "(node_obj['status']['conditions'] | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length) == 1"
+              - "(node_obj['metadata']['labels'].get('kubernetes.io/hostname', '') | length) > 0"
+            fail_msg: "STOP - {{ item }} is not Ready or lacks the kubernetes.io/hostname label"
+          vars:
+            node_obj: "{{ node_data['items'] | selectattr('metadata.name', 'equalto', item) | first }}"
+          loop: "{{ selected_nodes }}"
+
+        - name: "08 | Extract hostname label values for LocalVolumeSet selector"
+          ansible.builtin.set_fact:
+            selected_hostnames_json: |-
+              {% set ns = namespace(names=[]) %}
+              {% for node in node_data['items'] %}
+              {% if node['metadata']['name'] in selected_nodes %}
+              {% set ns.names = ns.names + [node['metadata']['labels']['kubernetes.io/hostname']] %}
+              {% endif %}
+              {% endfor %}
+              {{ ns.names | to_json }}
+
+        - name: "08 | Validate hostname label uniqueness"
+          ansible.builtin.assert:
+            that:
+              - "((selected_hostnames_json | from_json) | unique | list | length) == 3"
+            fail_msg: "STOP - Selected node hostname labels are not unique"
+
+        - name: "09 | Create the local plans directory"
+          ansible.builtin.file:
+            path: "{{ playbook_dir }}/../plans"
+            state: directory
+            mode: '0700'
+
+        - name: "09 | Write LOCAL review-only manifest (not applied)"
+          ansible.builtin.copy:
+            dest: "{{ plan_path }}"
+            mode: '0600'
+            content: |
+              # REVIEW ONLY. Do not apply without manual verification of actual disks.
+              # LocalVolumeSet selects ANY disk matching its size/media constraints
+              # on these nodes; it does not pin an exact /dev path.
+              apiVersion: local.storage.openshift.io/v1alpha1
+              kind: LocalVolumeSet
+              metadata:
+                name: {{ proposed_set_name }}
+                namespace: {{ local_storage_namespace }}
+              spec:
+                deviceInclusionSpec:
+                  deviceMechanicalProperties:
+                    - NonRotational
+                  deviceTypes:
+                    - disk
+                  minSize: {{ min_disk_size_gib }}Gi
+                maxDeviceCount: 1
+                nodeSelector:
+                  nodeSelectorTerms:
+                    - matchExpressions:
+                        - key: kubernetes.io/hostname
+                          operator: In
+                          values:
+              {% for hostname in selected_hostnames_json | from_json %}
+                            - {{ hostname | to_json }}
+              {% endfor %}
+                storageClassName: {{ proposed_storage_class }}
+                tolerations:
+                  - effect: NoSchedule
+                    key: node.ocs.openshift.io/storage
+                    operator: Equal
+                    value: "true"
+                volumeMode: Block
+
+        - name: "10 | Report the local manifest path"
+          ansible.builtin.debug:
+            msg: >-
+              LOCAL REVIEW MANIFEST WRITTEN: {{ plan_path }}.
+              The cluster and disks are unchanged. MANUAL VALIDATION REQUIRED before any future deployment.

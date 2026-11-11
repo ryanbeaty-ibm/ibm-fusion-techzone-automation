@@ -1,0 +1,122 @@
+---
+# Independent read-only verification of Fusion Operator and SpectrumFusion configuration.
+# Does NOT claim Data Foundation / ODF / Ceph are installed.
+- name: 'LAB | Verify IBM Fusion Operator and SpectrumFusion CR'
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    kubeconfig_path: ''
+    expected_api_server: ''
+    protected_api_server: ''
+    expected_fusion_csv: isf-operator.v2.14.1
+    fusion_namespace: ibm-spectrum-fusion-ns
+    fusion_cr_name: spectrumfusion
+    fusion_crd: spectrumfusions.prereq.isf.ibm.com
+    fusion_controller_deployments:
+      - isf-update-operator-controller-manager
+      - isf-serviceability-operator-controller-manager
+      - isf-data-protection-operator-controller-manager
+      - isf-ui-operator-controller-manager
+      - isf-platform-operator-controller-manager
+      - isf-prereq-operator-controller-manager
+      - isf-cns-operator-controller-manager
+      - isf-application-operator-controller-manager
+  tasks:
+    - name: '00 | Verify pinned target parameters'
+      ansible.builtin.assert:
+        that:
+          - kubeconfig_path | length > 0
+          - kubeconfig_path != (lookup('env', 'HOME') ~ '/.kube/config')
+          - expected_api_server is match('^https://[^/]+:6443$')
+          - protected_api_server | length == 0 or expected_api_server != protected_api_server
+
+    - name: '00 | Resolve actual API endpoint'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami, --show-server]
+      register: verify_server
+      changed_when: false
+
+    - name: '00 | Block an incorrect or protected cluster'
+      ansible.builtin.assert:
+        that:
+          - (verify_server.stdout | trim) == expected_api_server
+          - protected_api_server | length == 0 or (verify_server.stdout | trim) != protected_api_server
+
+    - name: '01 | Check Operator CSV status'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, csv, '{{ expected_fusion_csv }}', -n, '{{ fusion_namespace }}', -o, 'jsonpath={.status.phase}']
+      changed_when: false
+      register: verify_csv
+
+    - name: '01 | Confirm Operator succeeded'
+      ansible.builtin.assert:
+        that:
+          - (verify_csv.stdout | trim) == 'Succeeded'
+
+    - name: '02 | Read Operator Deployments'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, deployment, -n, '{{ fusion_namespace }}', -o, json]
+      changed_when: false
+      register: verify_deployments_raw
+
+    - name: '02 | Select eight expected Deployment controllers'
+      ansible.builtin.set_fact:
+        verify_deployments: >-
+          {{ (verify_deployments_raw.stdout | from_json)['items'] |
+             selectattr('metadata.name', 'in', fusion_controller_deployments) | list }}
+
+    - name: '02 | Require eight ready/available Operator deployments'
+      ansible.builtin.assert:
+        that:
+          - verify_deployments | length == 8
+          - >-
+            (verify_deployments | selectattr('status.readyReplicas', 'defined') |
+             list | length) == 8
+          - >-
+            (verify_deployments | selectattr('status.availableReplicas', 'defined') |
+             list | length) == 8
+          - >-
+            (verify_deployments | selectattr('status.readyReplicas', 'equalto', 1) |
+             list | length) == 8
+          - >-
+            (verify_deployments | selectattr('status.availableReplicas', 'equalto', 1) |
+             list | length) == 8
+        fail_msg: 'Operator CSV exists but one or more controller Deployments are not healthy.'
+
+    - name: '03 | Read SpectrumFusion instance'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, '{{ fusion_crd }}', '{{ fusion_cr_name }}', -n, '{{ fusion_namespace }}', -o, json]
+      changed_when: false
+      register: verify_cr_raw
+
+    - name: '03 | Confirm accepted license and disabled GDP'
+      ansible.builtin.assert:
+        that:
+          - (verify_cr_raw.stdout | from_json).spec.license.accept | bool
+          - not ((verify_cr_raw.stdout | from_json).spec.GlobalDataPlatform.Enable | bool)
+
+    - name: '04 | Read Fusion namespace pods for diagnostics'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, pods, -n, '{{ fusion_namespace }}', -o, json]
+      changed_when: false
+      register: verify_pods_raw
+
+    - name: '04 | Summarize any pending or image-pull pods (not necessarily failure during initialization)'
+      ansible.builtin.set_fact:
+        verify_problem_pods: >-
+          {{ (verify_pods_raw.stdout | from_json)['items'] |
+             rejectattr('status.phase', 'equalto', 'Running') |
+             rejectattr('status.phase', 'equalto', 'Succeeded') |
+             map(attribute='metadata.name') | list }}
+
+    - name: '05 | Report installation state truthfully'
+      ansible.builtin.debug:
+        msg:
+          - 'API={{ verify_server.stdout | trim }}'
+          - 'Fusion Operator={{ expected_fusion_csv }} / Succeeded'
+          - 'Eight expected Fusion Operator Deployments=ready'
+          - 'SpectrumFusion={{ fusion_namespace }}/{{ fusion_cr_name }} (license accepted, GDP disabled)'
+          - 'Pods not in Running or Succeeded phase={{ verify_problem_pods }}'
+          - 'PASS: Operator + CR configuration verified. Data Foundation/Ceph health NOT verified by this playbook.'

@@ -1,0 +1,188 @@
+---
+- name: Verify Ceph provisioning and persistence
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    pod_manifest: "apiVersion: v1\nkind: Pod\nmetadata:\n  name: fusion-pvc-test\n  namespace: {{ test_ns }}\nspec:\n  restartPolicy:\
+      \ Never\n  securityContext:\n    runAsNonRoot: true\n    seccompProfile:\n      type: RuntimeDefault\n  containers:\n\
+      \    - name: test\n      image: registry.access.redhat.com/ubi9/ubi-minimal:latest\n      command: [\"/bin/sh\", \"\
+      -c\", \"sleep 3600\"]\n      securityContext:\n        allowPrivilegeEscalation: false\n        capabilities:\n    \
+      \      drop: [\"ALL\"]\n      volumeMounts:\n        - name: storage\n          mountPath: /data\n  volumes:\n    -\
+      \ name: storage\n      persistentVolumeClaim:\n        claimName: fusion-storage-test\n"
+  tasks:
+  - name: 00 | Require explicit consent for temporary PVC creation and deletion
+    ansible.builtin.assert:
+      that:
+      - persistence_test_approved | default(false) | bool
+      - persistence_approval_phrase | default('') == 'I_APPROVE_TEMPORARY_PVC_TEST'
+      - kubeconfig_path | length > 0
+      - expected_api_server | length > 0
+      fail_msg: BLOCKED - PVC test modifies and deletes temporary resources; require explicit authorization.
+  - name: 00 | Resolve target before creating test namespace
+    ansible.builtin.command:
+      argv:
+      - oc
+      - --kubeconfig={{ kubeconfig_path }}
+      - whoami
+      - --show-server
+    register: p_bound_api
+    changed_when: false
+  - name: 00 | Refuse wrong target
+    ansible.builtin.assert:
+      that:
+      - (p_bound_api.stdout | trim) == (expected_api_server | trim)
+      fail_msg: BLOCKED - Wrong cluster for temporary PVC test
+  - name: Generate a unique test namespace
+    ansible.builtin.set_fact:
+      test_ns: fusion-test-{{ lookup('pipe', 'date +%s') }}
+  - name: Run storage validation
+    block:
+    - name: 01 | Create test namespace
+      ansible.builtin.command:
+        argv:
+        - oc
+        - --kubeconfig={{ kubeconfig_path }}
+        - create
+        - namespace
+        - '{{ test_ns }}'
+    - name: 02 | Provision 1 GiB Ceph PVC
+      ansible.builtin.command:
+        argv:
+        - oc
+        - --kubeconfig={{ kubeconfig_path }}
+        - apply
+        - -f
+        - '-'
+        stdin: "apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: fusion-storage-test\n  namespace: {{ test_ns\
+          \ }}\nspec:\n  accessModes: [ReadWriteOnce]\n  resources:\n    requests:\n      storage: 1Gi\n  storageClassName:\
+          \ ocs-storagecluster-ceph-rbd\n"
+    - name: 03 | Wait for PVC to become Bound
+      ansible.builtin.command:
+        argv:
+        - oc
+        - --kubeconfig={{ kubeconfig_path }}
+        - get
+        - pvc
+        - fusion-storage-test
+        - -n
+        - '{{ test_ns }}'
+        - -o
+        - jsonpath={.status.phase}
+      register: pvc_result
+      until: pvc_result.stdout == "Bound"
+      retries: 36
+      delay: 5
+      changed_when: false
+    - name: 03 | PVC provisioned
+      ansible.builtin.debug:
+        msg: PASS - Ceph PVC Bound (1 GiB)
+    - name: 04 | Create test Pod
+      ansible.builtin.command:
+        argv:
+        - oc
+        - --kubeconfig={{ kubeconfig_path }}
+        - apply
+        - -f
+        - '-'
+        stdin: '{{ pod_manifest }}'
+    - name: 05 | Wait for test Pod
+      ansible.builtin.command:
+        argv:
+        - oc
+        - --kubeconfig={{ kubeconfig_path }}
+        - wait
+        - pod/fusion-pvc-test
+        - -n
+        - '{{ test_ns }}'
+        - --for=condition=Ready
+        - --timeout=180s
+      changed_when: false
+    - name: 06 | Write data to Ceph
+      ansible.builtin.command:
+        argv:
+        - oc
+        - --kubeconfig={{ kubeconfig_path }}
+        - exec
+        - -n
+        - '{{ test_ns }}'
+        - fusion-pvc-test
+        - --
+        - sh
+        - -c
+        - echo "IBM Fusion Persistence Test PASSED" > /data/test.txt
+    - name: 07 | Delete original Pod
+      ansible.builtin.command:
+        argv:
+        - oc
+        - --kubeconfig={{ kubeconfig_path }}
+        - delete
+        - pod/fusion-pvc-test
+        - -n
+        - '{{ test_ns }}'
+        - --wait=true
+    - name: 08 | Recreate Pod with same PVC
+      ansible.builtin.command:
+        argv:
+        - oc
+        - --kubeconfig={{ kubeconfig_path }}
+        - apply
+        - -f
+        - '-'
+        stdin: '{{ pod_manifest }}'
+    - name: 09 | Wait for recreated Pod
+      ansible.builtin.command:
+        argv:
+        - oc
+        - --kubeconfig={{ kubeconfig_path }}
+        - wait
+        - pod/fusion-pvc-test
+        - -n
+        - '{{ test_ns }}'
+        - --for=condition=Ready
+        - --timeout=180s
+      changed_when: false
+    - name: 10 | Read original data
+      ansible.builtin.command:
+        argv:
+        - oc
+        - --kubeconfig={{ kubeconfig_path }}
+        - exec
+        - -n
+        - '{{ test_ns }}'
+        - fusion-pvc-test
+        - --
+        - cat
+        - /data/test.txt
+      register: persistence_result
+      changed_when: false
+    - name: 11 | Validate data persistence
+      ansible.builtin.assert:
+        that:
+        - persistence_result.stdout == "IBM Fusion Persistence Test PASSED"
+        success_msg: PASS - Data survived Pod deletion and recreation
+        fail_msg: FAIL - Persistent data was lost or corrupted
+    - name: 12 | Storage validation complete
+      ansible.builtin.debug:
+        msg: PASS - Ceph provisioning and persistence verified
+    always:
+    - name: CLEANUP | Delete temporary namespace and storage
+      ansible.builtin.command:
+        argv:
+        - oc
+        - --kubeconfig={{ kubeconfig_path }}
+        - delete
+        - namespace
+        - '{{ test_ns }}'
+        - --ignore-not-found
+        - --wait=true
+        - --timeout=180s
+      register: cleanup_result
+      failed_when: false
+    - name: CLEANUP | Report result
+      ansible.builtin.debug:
+        msg: "{{ 'PASS - Test namespace removed'\n   if cleanup_result.rc == 0\n   else 'WARNING - Cleanup failed; inspect\
+          \ ' ~ test_ns }}"
+  environment:
+    KUBECONFIG: '{{ kubeconfig_path }}'

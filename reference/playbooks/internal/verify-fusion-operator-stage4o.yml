@@ -1,0 +1,218 @@
+---
+# Phase 4O - Read-only IBM Fusion Operator OLM and Deployment readiness.
+# Does not approve an InstallPlan, install resources, or touch disks.
+# On the second cluster, pass a separate kubeconfig_path AND expected_api_server.
+- name: 'Phase 4O | Audit Fusion Operator readiness without changes'
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    scenario: live
+    kubeconfig_path: "{{ lookup('env', 'HOME') }}/.kube/config"
+    expected_api_server: ''
+    fusion_namespace: ibm-spectrum-fusion-ns
+    fusion_package: isf-operator
+    fusion_catalog: ibm-operator-catalog
+    fusion_channel: v2.0
+    expected_fusion_csv: isf-operator.v2.14.1
+  tasks:
+    - name: '00 | Refuse write flags and unknown simulation modes'
+      ansible.builtin.assert:
+        that:
+          - scenario in ['live', 'empty', 'pending', 'installed']
+          - not (operator_phase_apply | default(false) | bool)
+          - not (approve_fusion_installplan | default(false) | bool)
+          - not (approve_installplan | default(false) | bool)
+          - not (install_operators | default(false) | bool)
+          - not (initialize_fusion | default(false) | bool)
+          - not (install_data_foundation | default(false) | bool)
+          - not (approve_disk_claim | default(false) | bool)
+          - not (deploy | default(false) | bool)
+          - not (apply | default(false) | bool)
+        fail_msg: 'BLOCKED - Stage 4O is read-only. Remove write-capable flags.'
+        success_msg: 'PASS - Stage 4O is read-only'
+
+    - name: '01 | Show offline workflow expectation (no cluster calls)'
+      ansible.builtin.debug:
+        msg:
+          - 'SIMULATION ONLY - {{ scenario }}; no OpenShift API calls'
+          - >-
+            {{ 'No Operator installation: expect bootstrap stage 4L first' if scenario == 'empty'
+               else 'Manual InstallPlan pending: review 4M and separately approve with 4N' if scenario == 'pending'
+               else 'Operator should have Succeeded CSV and fully Ready Deployments (NOT verified by simulation)' }}
+          - 'No changes will be made'
+      when: scenario != 'live'
+
+    - name: '02 | Audit live cluster'
+      when: scenario == 'live'
+      block:
+        - name: '02 | Check kubeconfig file'
+          ansible.builtin.stat:
+            path: '{{ kubeconfig_path }}'
+          register: o_kubeconfig
+
+        - name: '02 | Require a regular kubeconfig file'
+          ansible.builtin.assert:
+            that:
+              - o_kubeconfig.stat.exists | default(false)
+              - o_kubeconfig.stat.isreg | default(false)
+            fail_msg: 'BLOCKED - Kubeconfig missing: {{ kubeconfig_path }}'
+
+        - name: '02 | Discover API endpoint'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami, --show-server]
+          changed_when: false
+          register: o_server
+
+        - name: '02 | Discover authenticated identity'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami]
+          changed_when: false
+          register: o_identity
+
+        - name: '02 | Check supplied API pin (required for non-default kubeconfig)'
+          ansible.builtin.assert:
+            that:
+              - expected_api_server | length > 0 or kubeconfig_path == (lookup('env', 'HOME') ~ '/.kube/config')
+              - expected_api_server | length == 0 or (o_server.stdout | trim) == (expected_api_server | trim)
+            fail_msg: 'BLOCKED - Explicit kubeconfig requires expected_api_server, which must match.'
+            success_msg: 'PASS - OpenShift target binding checked'
+
+        - name: '03 | Inventory Subscriptions cluster-wide'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, subscriptions, -A, -o, json]
+          changed_when: false
+          register: o_subs_raw
+
+        - name: '03 | Inventory InstallPlans cluster-wide'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, installplans, -A, -o, json]
+          changed_when: false
+          register: o_plans_raw
+
+        - name: '03 | Inventory CSVs cluster-wide'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, csv, -A, -o, json]
+          changed_when: false
+          register: o_csvs_raw
+
+        - name: '03 | Inventory Deployments cluster-wide (read-only)'
+          ansible.builtin.command:
+            argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, deployments, -A, -o, json]
+          changed_when: false
+          register: o_deploys_raw
+
+        - name: '04 | Select the expected Fusion resources'
+          ansible.builtin.set_fact:
+            o_subscriptions: >-
+              {{ (o_subs_raw.stdout | from_json)['items'] |
+                 selectattr('metadata.namespace', 'equalto', fusion_namespace) |
+                 selectattr('spec.name', 'defined') |
+                 selectattr('spec.name', 'equalto', fusion_package) | list }}
+            o_csvs: >-
+              {{ (o_csvs_raw.stdout | from_json)['items'] |
+                 selectattr('metadata.namespace', 'equalto', fusion_namespace) |
+                 selectattr('metadata.name', 'equalto', expected_fusion_csv) | list }}
+            o_installplans: >-
+              {{ (o_plans_raw.stdout | from_json)['items'] |
+                 selectattr('metadata.namespace', 'equalto', fusion_namespace) | list }}
+            o_deployments: >-
+              {{ (o_deploys_raw.stdout | from_json)['items'] |
+                 selectattr('metadata.namespace', 'equalto', fusion_namespace) | list }}
+
+        - name: '04 | Refuse duplicate Fusion Subscriptions and CSVs'
+          ansible.builtin.assert:
+            that:
+              - o_subscriptions | length <= 1
+              - o_csvs | length <= 1
+            fail_msg: 'BLOCKED - Ambiguous duplicate Fusion resources; investigate first.'
+
+        - name: '04 | Record Subscription and CSV state'
+          ansible.builtin.set_fact:
+            o_subscription_plan_name: >-
+              {{ o_subscriptions[0].status.installplan.name | default('') if (o_subscriptions | length == 1) else '' }}
+            o_subscription_manual: >-
+              {{ (o_subscriptions[0].spec.installPlanApproval | default('')) == 'Manual'
+                 if (o_subscriptions | length == 1) else false }}
+            o_subscription_expected: >-
+              {{ ((o_subscriptions[0].spec.channel | default('')) == fusion_channel and
+                  (o_subscriptions[0].spec.source | default('')) == fusion_catalog and
+                  (o_subscriptions[0].spec.sourceNamespace | default('')) == 'openshift-marketplace')
+                 if (o_subscriptions | length == 1) else false }}
+            o_csv_phase: >-
+              {{ o_csvs[0].status.phase | default('Unknown') if (o_csvs | length == 1) else 'NotFound' }}
+            o_expected_deploy_names: >-
+              {{ (o_csvs[0].spec.install.spec.deployments | default([]) | map(attribute='name') | list)
+                 if (o_csvs | length == 1) else [] }}
+
+        - name: '04 | Resolve only Subscription-referenced InstallPlan'
+          ansible.builtin.set_fact:
+            o_referenced_plans: >-
+              {{ o_installplans | selectattr('metadata.name', 'equalto', o_subscription_plan_name) | list
+                 if o_subscription_plan_name | length > 0 else [] }}
+            o_all_deployments_ready: true
+
+        - name: '05 | Refuse non-Manual Subscription and unexpected source/channel'
+          ansible.builtin.assert:
+            that:
+              - o_subscription_manual | bool
+              - o_subscription_expected | bool
+            fail_msg: 'BLOCKED - Unexpected Fusion Subscription approval policy, catalog or channel.'
+          when: o_subscriptions | length == 1
+
+        - name: '05 | Check referenced InstallPlan safety, if present'
+          ansible.builtin.assert:
+            that:
+              - o_referenced_plans | length == 1
+              - o_referenced_plans[0].spec.approval | default('') == 'Manual'
+              - expected_fusion_csv in (o_referenced_plans[0].spec.clusterServiceVersionNames | default([]))
+            fail_msg: 'BLOCKED - Unexpected Fusion InstallPlan; inspect Phase 4M.'
+          when: o_subscription_plan_name | length > 0
+
+        - name: '06 | Show expected operator Deployment health'
+          ansible.builtin.debug:
+            msg: >-
+              {{ item }}: found={{ o_matches | length }};
+              ready={{ o_matches[0].status.readyReplicas | default(0) if o_matches | length == 1 else 0 }}/{{ o_matches[0].spec.replicas | default(1) if o_matches | length == 1 else '?' }};
+              available={{ o_matches[0].status.availableReplicas | default(0) if o_matches | length == 1 else 0 }}
+          vars:
+            o_matches: "{{ o_deployments | selectattr('metadata.name', 'equalto', item) | list }}"
+          loop: '{{ o_expected_deploy_names }}'
+
+        - name: '06 | Accumulate operator Deployment readiness'
+          ansible.builtin.set_fact:
+            o_all_deployments_ready: >-
+              {{ (o_all_deployments_ready | bool) and (o_matches | length == 1)
+                 and ((o_matches[0].status.readyReplicas | default(0) | int) >= (o_matches[0].spec.replicas | default(1) | int))
+                 and ((o_matches[0].status.availableReplicas | default(0) | int) >= (o_matches[0].spec.replicas | default(1) | int)) }}
+          vars:
+            o_matches: "{{ o_deployments | selectattr('metadata.name', 'equalto', item) | list }}"
+          loop: '{{ o_expected_deploy_names }}'
+
+        - name: '07 | Classify installation readiness'
+          ansible.builtin.set_fact:
+            o_state: >-
+              {% if o_csv_phase == 'Succeeded' and (o_expected_deploy_names | length > 0) and (o_all_deployments_ready | bool) %}READY
+              {% elif o_csv_phase == 'Succeeded' %}CSV_SUCCEEDED_DEPLOYMENTS_NOT_READY
+              {% elif o_subscriptions | length == 0 %}NOT_INSTALLED_NO_SUBSCRIPTION
+              {% elif o_subscription_plan_name | length == 0 %}WAITING_FOR_INSTALLPLAN
+              {% elif o_referenced_plans | length == 1 and not (o_referenced_plans[0].spec.approved | default(false) | bool) %}WAITING_FOR_MANUAL_APPROVAL
+              {% elif o_referenced_plans | length == 1 %}INSTALLING_OR_WAITING_FOR_CSV
+              {% else %}NEEDS_REVIEW{% endif %}
+
+        - name: '07 | Report Operator readiness (read-only)'
+          ansible.builtin.debug:
+            msg:
+              - 'Target={{ o_server.stdout | trim }}; identity={{ o_identity.stdout | trim }}'
+              - 'Kubeconfig={{ kubeconfig_path }}; API pin={{ expected_api_server | length > 0 }}'
+              - 'Expected CSV={{ expected_fusion_csv }}; matching CSV count={{ o_csvs | length }}; CSV phase={{ o_csv_phase }}'
+              - 'Subscription count={{ o_subscriptions | length }}; Manual={{ o_subscription_manual }}'
+              - 'Referenced InstallPlan={{ o_subscription_plan_name | default("none", true) }}; found={{ o_referenced_plans | length == 1 }}'
+              - 'Operator deployment count={{ o_expected_deploy_names | length }}; all ready={{ o_all_deployments_ready }}'
+              - 'STATE={{ o_state | trim }}'
+              - 'NO CHANGES - This stage does not approve InstallPlans or create resources.'
+
+    - name: '99 | Phase 4O completed'
+      ansible.builtin.debug:
+        msg: 'PASS - Stage 4O finished without modifying any OpenShift resources.'

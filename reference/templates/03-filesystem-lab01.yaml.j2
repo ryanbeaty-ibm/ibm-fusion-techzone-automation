@@ -1,0 +1,9 @@
+apiVersion: scale.spectrum.ibm.com/v1beta1
+kind: Filesystem
+metadata:
+  name: {{ scale_name }}-{{ scale_filesystem }}
+  namespace: {{ scale_namespace }}
+spec:
+  remote:
+    cluster: {{ scale_name }}
+    fs: {{ scale_filesystem }}

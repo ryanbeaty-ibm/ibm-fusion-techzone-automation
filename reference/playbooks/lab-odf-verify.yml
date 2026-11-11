@@ -1,0 +1,71 @@
+---
+# Read-only Ceph/ODF verification. No changes to clusters or disks.
+- name: 'LAB | Verify Data Foundation local Ceph readiness'
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    kubeconfig_path: ''
+    expected_api_server: ''
+    protected_api_server: ''
+    fusion_namespace: ibm-spectrum-fusion-ns
+    odf_storage_namespace: openshift-storage
+    odf_local_storage_class: fusion-ceph-local
+  tasks:
+    - name: '00 | Connected API'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', whoami, --show-server]
+      register: ov_api
+      changed_when: false
+
+    - name: '00 | Verify only pinned lab target'
+      ansible.builtin.assert:
+        that:
+          - ov_api.stdout | trim == expected_api_server
+          - ov_api.stdout | trim != protected_api_server
+          - kubeconfig_path != (lookup('env', 'HOME') ~ '/.kube/config')
+
+    - name: '01 | Get Fusion Data Foundation service status'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, fusionserviceinstance, odfmanager, -n, '{{ fusion_namespace }}', -o, json]
+      register: ov_fsi
+      changed_when: false
+
+    - name: '02 | Inspect StorageCluster status'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, storagecluster, ocs-storagecluster, -n, '{{ odf_storage_namespace }}', -o, json]
+      register: ov_cluster
+      changed_when: false
+
+    - name: '03 | Inspect local PVs'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, pv, -o, json]
+      register: ov_pvs
+      changed_when: false
+
+    - name: '04 | Inspect StorageClasses'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, storageclass, -o, json]
+      register: ov_scs
+      changed_when: false
+
+    - name: '05 | Inspect Ceph pods'
+      ansible.builtin.command:
+        argv: [oc, '--kubeconfig={{ kubeconfig_path }}', get, pods, -n, '{{ odf_storage_namespace }}', -o, json]
+      register: ov_pods
+      changed_when: false
+
+    - name: '06 | Require Ceph StorageCluster Ready, 3 OSDs and RBD storage'
+      ansible.builtin.assert:
+        that:
+          - (ov_fsi.stdout | from_json).spec.serviceDefinition == 'data-foundation-service'
+          - (ov_cluster.stdout | from_json).status.phase | default('') == 'Ready'
+          - ((ov_pvs.stdout | from_json)["items"] | selectattr('spec.storageClassName', 'equalto', odf_local_storage_class) | list | length) == 3
+          - ((ov_scs.stdout | from_json)["items"] | selectattr('metadata.name', 'equalto', 'ocs-storagecluster-ceph-rbd') | list | length) == 1
+          - ((ov_pods.stdout | from_json)["items"] | selectattr('metadata.name', 'match', '^rook-ceph-osd-[0-9]+-') | selectattr('status.phase', 'equalto', 'Running') | list | length) >= 3
+        fail_msg: 'BLOCKED: Ceph is not fully Ready. Inspect ODF pods, storagecluster, OSDs and ODF operator events.'
+
+    - name: '99 | Verified deployment'
+      ansible.builtin.debug:
+        msg: 'PASS: Fusion Data Foundation + 3 Ceph OSD pods + StorageCluster Ready + RBD StorageClass; read-only verification.'

@@ -1,0 +1,518 @@
+---
+# IBM Storage Fusion installer - Stages 1-4 (preflight, operators, Fusion CR, ODF inventory)
+# Target: OpenShift 4.21, IBM Storage Fusion 2.14.x
+# SAFE DEFAULT: READ ONLY. No cluster resource is changed unless explicitly opted in.
+# Stage 2 install (fresh cluster only): -e install_operators=true
+# Stage 3 initialization (separate run, after operator health is confirmed):
+#     -e initialize_fusion=true -e accept_ibm_license=true
+# Stage 4: READ-ONLY Data Foundation / Ceph / LocalVolumeSet detection and validation.
+# Does NOT install the Fusion Data Foundation service or configure any storage disks.
+# Does NOT update an existing SpectrumFusion CR.
+- name: IBM Fusion Operator installation (preflight and guarded deployment)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    install_operators: false
+    initialize_fusion: false
+    accept_ibm_license: false
+    operator_packages:
+      - package: isf-operator
+        namespace: ibm-spectrum-fusion-ns
+        catalog: ibm-operator-catalog
+        channel: v2.0
+      - package: local-storage-operator
+        namespace: openshift-local-storage
+        catalog: redhat-operators
+        channel: stable
+
+  tasks:
+    - name: "01 | Verify OpenShift authentication"
+      ansible.builtin.command: oc whoami
+      register: identity
+      changed_when: false
+
+    - name: "01 | Authentication result"
+      ansible.builtin.debug:
+        msg: "PASS - Connected as {{ identity.stdout }}"
+
+    - name: "02 | Check OpenShift version"
+      ansible.builtin.command:
+        argv: [oc, get, clusterversion, version, -o, 'jsonpath={.status.desired.version}']
+      register: ocp_version
+      changed_when: false
+
+    - name: "02 | Validate tested OpenShift version"
+      ansible.builtin.assert:
+        that:
+          - ocp_version.stdout is match('^4[.]21[.]')
+        success_msg: "PASS - OpenShift {{ ocp_version.stdout }}"
+        fail_msg: "This version of the playbook targets OpenShift 4.21 only. Found {{ ocp_version.stdout }}."
+
+    - name: "03 | Wait for all nodes to be Ready"
+      ansible.builtin.command:
+        argv: [oc, wait, node, --all, '--for=condition=Ready', '--timeout=120s']
+      changed_when: false
+
+    - name: "03 | Discover cluster nodes"
+      ansible.builtin.command:
+        argv: [oc, get, nodes, -o, json]
+      register: nodes
+      changed_when: false
+
+    - name: "03 | Validate node count"
+      ansible.builtin.assert:
+        that:
+          - ((nodes.stdout | from_json)['items'] | length) >= 3
+        success_msg: "PASS - {{ (nodes.stdout | from_json)['items'] | length }} nodes Ready"
+        fail_msg: "At least three nodes are required for this lab configuration."
+
+    - name: "04 | Discover Operator packages"
+      ansible.builtin.command:
+        argv: [oc, get, packagemanifest, '{{ item.package }}', -n, openshift-marketplace, -o, json]
+      loop: "{{ operator_packages }}"
+      loop_control:
+        label: "{{ item.package }}"
+      register: package_responses
+      changed_when: false
+
+    # Summarize package metadata before assertion to avoid printing megabytes
+    # of the catalog's embedded CSV descriptions on an assertion failure.
+    - name: "04 | Extract compact catalog details"
+      ansible.builtin.set_fact:
+        package_checks: >-
+          {{
+            (package_checks | default([])) + [{
+              'package': item.item.package,
+              'expected_catalog': item.item.catalog,
+              'actual_catalog': (item.stdout | from_json).status.catalogSource,
+              'requested_channel': item.item.channel,
+              'available_channels': ((item.stdout | from_json).status.channels | map(attribute='name') | list)
+            }]
+          }}
+      loop: "{{ package_responses.results }}"
+      loop_control:
+        label: "{{ item.item.package }}"
+
+    - name: "04 | Validate catalog and available channel"
+      ansible.builtin.assert:
+        that:
+          - item.actual_catalog == item.expected_catalog
+          - item.requested_channel in item.available_channels
+        success_msg: "PASS - {{ item.package }} in {{ item.actual_catalog }} / {{ item.requested_channel }}"
+        fail_msg: "Catalog/channel mismatch for {{ item.package }}: {{ item.actual_catalog }}, {{ item.available_channels }}"
+      loop: "{{ package_checks }}"
+      loop_control:
+        label: "{{ item.package }}"
+
+    - name: "05 | Discover all installed Operator CSVs"
+      ansible.builtin.command:
+        argv: [oc, get, csv, -A, -o, json]
+      register: csv_response
+      changed_when: false
+
+    - name: "05 | Discover Operator Subscriptions"
+      ansible.builtin.command:
+        argv: [oc, get, subscriptions, -A, -o, json]
+      register: subscriptions_response
+      changed_when: false
+
+    - name: "05 | Discover OperatorGroups"
+      ansible.builtin.command:
+        argv: [oc, get, operatorgroups, -A, -o, json]
+      register: operatorgroups_response
+      changed_when: false
+
+    - name: "05 | Parse Operator resources"
+      ansible.builtin.set_fact:
+        csv_items: "{{ (csv_response.stdout | from_json)['items'] }}"
+        subscription_items: "{{ (subscriptions_response.stdout | from_json)['items'] }}"
+        operatorgroup_items: "{{ (operatorgroups_response.stdout | from_json)['items'] }}"
+
+    - name: "05 | Detect installed Operators using succeeded CSVs"
+      ansible.builtin.set_fact:
+        operator_status: >-
+          {{
+            (operator_status | default([])) + [{
+              'package': item.package,
+              'namespace': item.namespace,
+              'catalog': item.catalog,
+              'channel': item.channel,
+              'csv_names': (
+                csv_items | selectattr('metadata.namespace', 'equalto', item.namespace)
+                | selectattr('metadata.name', 'match', '^' ~ item.package ~ '[.]')
+                | map(attribute='metadata.name') | list
+              ),
+              'installed': (
+                csv_items | selectattr('metadata.namespace', 'equalto', item.namespace)
+                | selectattr('metadata.name', 'match', '^' ~ item.package ~ '[.]')
+                | selectattr('status.phase', 'equalto', 'Succeeded') | list | length > 0
+              )
+            }]
+          }}
+      loop: "{{ operator_packages }}"
+      loop_control:
+        label: "{{ item.package }}"
+
+    - name: "05 | Show detected installation status"
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'PASS - Already installed' if item.installed else 'NOT INSTALLED' }}:
+          {{ item.package }} in {{ item.namespace }}.
+          CSVs: {{ item.csv_names | join(', ') if item.csv_names else 'none' }}
+      loop: "{{ operator_status }}"
+      loop_control:
+        label: "{{ item.package }}"
+
+    - name: "05 | Report subscription state"
+      ansible.builtin.debug:
+        msg: >-
+          Found {{ subscription_items | length }} Subscription(s) cluster-wide.
+          Successful CSVs are authoritative for this stage's already-installed check;
+          missing Subscriptions are not automatically repaired.
+
+    - name: "06 | Summarize planned actions"
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'DEPLOYMENT ENABLED' if install_operators | bool else 'READ-ONLY MODE' }}.
+          Missing Operators: {{ operator_status | rejectattr('installed', 'equalto', true)
+          | map(attribute='package') | list | join(', ') | default('none', true) }}.
+          Existing successful installations will not be modified.
+
+    - name: "07 | Install missing Operators (explicit opt-in only)"
+      when: install_operators | bool
+      block:
+        - name: "07 | Refuse to overwrite incomplete Operator installations"
+          ansible.builtin.assert:
+            that:
+              - item.installed or item.csv_names | length == 0
+            fail_msg: >-
+              {{ item.package }} has a CSV but is not Succeeded. Inspect its CSV and
+              installation state before trying to install another copy.
+          loop: "{{ operator_status }}"
+          loop_control:
+            label: "{{ item.package }}"
+
+        - name: "07 | Check for preexisting Subscriptions for missing Operators"
+          ansible.builtin.assert:
+            that:
+              - item.installed or
+                (subscription_items | selectattr('spec.name', 'equalto', item.package) | list | length == 0)
+            fail_msg: >-
+              A Subscription for {{ item.package }} already exists, but no successful CSV was found.
+              Investigate the existing Subscription/InstallPlan rather than creating a duplicate.
+          loop: "{{ operator_status }}"
+          loop_control:
+            label: "{{ item.package }}"
+
+        - name: "07 | Validate OperatorGroups in missing Operator namespaces"
+          ansible.builtin.assert:
+            that:
+              - >-
+                (operatorgroup_items | selectattr('metadata.namespace', 'equalto', item.namespace)
+                | list | length) <= 1
+              - >-
+                (operatorgroup_items | selectattr('metadata.namespace', 'equalto', item.namespace)
+                | list | length) == 0 or
+                (operatorgroup_items | selectattr('metadata.namespace', 'equalto', item.namespace)
+                | map(attribute='spec.targetNamespaces') | first) == [item.namespace]
+            fail_msg: >-
+              {{ item.namespace }} has an unexpected OperatorGroup configuration.
+              Review it manually to avoid changing another Operator's scope.
+          loop: "{{ operator_status | rejectattr('installed', 'equalto', true) | list }}"
+          loop_control:
+            label: "{{ item.package }}"
+
+        - name: "08 | Create namespaces for missing Operators"
+          ansible.builtin.command:
+            argv: [oc, apply, -f, -]
+            stdin: |
+              apiVersion: v1
+              kind: Namespace
+              metadata:
+                name: {{ item.namespace }}
+          loop: "{{ operator_status | rejectattr('installed', 'equalto', true) | list }}"
+          loop_control:
+            label: "{{ item.namespace }}"
+          register: namespace_result
+          changed_when: "'created' in namespace_result.stdout or 'configured' in namespace_result.stdout"
+
+        - name: "09 | Create missing OperatorGroups"
+          ansible.builtin.command:
+            argv: [oc, apply, -f, -]
+            stdin: |
+              apiVersion: operators.coreos.com/v1
+              kind: OperatorGroup
+              metadata:
+                name: {{ item.package }}-group
+                namespace: {{ item.namespace }}
+              spec:
+                targetNamespaces:
+                  - {{ item.namespace }}
+          loop: "{{ operator_status | rejectattr('installed', 'equalto', true) | list }}"
+          loop_control:
+            label: "{{ item.package }}"
+          when: >-
+            (operatorgroup_items | selectattr('metadata.namespace', 'equalto', item.namespace)
+            | list | length) == 0
+          register: operatorgroup_result
+          changed_when: "'created' in operatorgroup_result.stdout or 'configured' in operatorgroup_result.stdout"
+
+        - name: "10 | Subscribe to missing Operators"
+          ansible.builtin.command:
+            argv: [oc, apply, -f, -]
+            stdin: |
+              apiVersion: operators.coreos.com/v1alpha1
+              kind: Subscription
+              metadata:
+                name: {{ item.package }}
+                namespace: {{ item.namespace }}
+              spec:
+                channel: {{ item.channel }}
+                installPlanApproval: Automatic
+                name: {{ item.package }}
+                source: {{ item.catalog }}
+                sourceNamespace: openshift-marketplace
+          loop: "{{ operator_status | rejectattr('installed', 'equalto', true) | list }}"
+          loop_control:
+            label: "{{ item.package }}"
+          register: subscription_result
+          changed_when: "'created' in subscription_result.stdout or 'configured' in subscription_result.stdout"
+
+        - name: "11 | Wait for newly installed Operator CSVs to succeed"
+          ansible.builtin.command:
+            argv: [oc, get, csv, -n, '{{ item.namespace }}', -o, json]
+          loop: "{{ operator_status | rejectattr('installed', 'equalto', true) | list }}"
+          loop_control:
+            label: "{{ item.package }}"
+          register: install_csv_result
+          until: >-
+            (install_csv_result.stdout | from_json)['items']
+            | selectattr('metadata.name', 'match', '^' ~ item.package ~ '[.]')
+            | selectattr('status.phase', 'equalto', 'Succeeded') | list | length > 0
+          retries: 120
+          delay: 10
+          changed_when: false
+
+        - name: "12 | Operator installation stage complete"
+          ansible.builtin.debug:
+            msg: "PASS - Required Operators have succeeded. Fusion instance and ODF are separate stages."
+
+    # Stage 3: inspect the Fusion CR without touching the running deployment.
+    - name: "13 | Discover SpectrumFusion CRD"
+      ansible.builtin.command:
+        argv: [oc, get, crd, spectrumfusions.prereq.isf.ibm.com, -o, name]
+      register: spectrumfusion_crd
+      changed_when: false
+      failed_when: false
+
+    - name: "13 | Look up SpectrumFusion instance"
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - spectrumfusion
+          - spectrumfusion
+          - -n
+          - ibm-spectrum-fusion-ns
+          - -o
+          - json
+      register: spectrumfusion_lookup
+      changed_when: false
+      failed_when: >-
+        spectrumfusion_lookup.rc != 0 and
+        'not found' not in (spectrumfusion_lookup.stderr | lower)
+      when: spectrumfusion_crd.rc == 0
+
+    - name: "13 | Determine Fusion initialization status"
+      ansible.builtin.set_fact:
+        fusion_instance_exists: "{{ (spectrumfusion_lookup.rc | default(1)) == 0 }}"
+
+    - name: "13 | Display current Fusion initialization status"
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'PASS - SpectrumFusion instance already exists in ibm-spectrum-fusion-ns'
+          if fusion_instance_exists else
+          'NOT INITIALIZED - No SpectrumFusion instance detected' }}.
+          {{ 'Deployment mode was enabled' if initialize_fusion | bool else 'READ-ONLY: nothing will be created' }}.
+
+    - name: "14 | Validate existing Fusion configuration"
+      ansible.builtin.assert:
+        that:
+          - spectrumfusion_config.spec.license.accept | default(false) | bool
+          - not (spectrumfusion_config.spec.GlobalDataPlatform.Enable | default(false) | bool)
+        success_msg: "PASS - License accepted and Global Data Platform disabled on existing Fusion instance"
+        fail_msg: >-
+          Existing Fusion instance differs from the expected lab configuration.
+          No changes were made. Review its spec instead of overwriting it.
+      vars:
+        spectrumfusion_config: "{{ spectrumfusion_lookup.stdout | from_json }}"
+      when: fusion_instance_exists
+
+    - name: "15 | Initialize Fusion only after explicit user opt-in"
+      when:
+        - initialize_fusion | bool
+        - not fusion_instance_exists
+      block:
+        - name: "15 | Require installed Fusion Operator and explicit license acceptance"
+          ansible.builtin.assert:
+            that:
+              - accept_ibm_license | bool
+              - (operator_status | selectattr('package', 'equalto', 'isf-operator')
+                 | selectattr('installed', 'equalto', true) | list | length) == 1
+              - spectrumfusion_crd.rc == 0
+            fail_msg: >-
+              Refusing to create SpectrumFusion. Run Operator installation separately,
+              verify its succeeded CSV, and explicitly set accept_ibm_license=true
+              only if you are authorized to accept the IBM license.
+
+        - name: "15 | Create SpectrumFusion CR with GDP disabled"
+          ansible.builtin.command:
+            argv: [oc, create, -f, -]
+            stdin: |
+              apiVersion: prereq.isf.ibm.com/v1
+              kind: SpectrumFusion
+              metadata:
+                name: spectrumfusion
+                namespace: ibm-spectrum-fusion-ns
+              spec:
+                license:
+                  accept: true
+                GlobalDataPlatform:
+                  Enable: false
+                configuration:
+                  services:
+                    skipOnBoardingServices: false
+          register: create_spectrumfusion
+          changed_when: "'created' in create_spectrumfusion.stdout"
+
+        - name: "15 | Confirm new Fusion CR is readable"
+          ansible.builtin.command:
+            argv: [oc, get, spectrumfusion, spectrumfusion, -n, ibm-spectrum-fusion-ns, -o, name]
+          register: created_fusion_check
+          until: created_fusion_check.rc == 0
+          retries: 30
+          delay: 10
+          changed_when: false
+
+    - name: "16 | Report next stage"
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'PASS - Fusion CR exists. No changes to existing CR.' if fusion_instance_exists
+          else ('Fusion CR creation requested; check subsequent service readiness.'
+          if initialize_fusion | bool else 'Fusion CR absent: would initialize only with explicit opt-in.') }}
+          Data Foundation installation and local disk setup are future stages.
+
+    # Stage 4: Read-only inventory of Data Foundation, Ceph and local storage.
+    # On an uninstalled cluster, missing CRDs and objects are expected.
+    - name: "17 | Check Data Foundation and local-storage CRDs"
+      ansible.builtin.command:
+        argv: [oc, get, crd, "{{ item }}", -o, name, --ignore-not-found]
+      loop:
+        - fusionserviceinstances.service.isf.ibm.com
+        - storageclusters.ocs.openshift.io
+        - localvolumesets.local.storage.openshift.io
+      register: storage_crds
+      changed_when: false
+
+    - name: "17 | Discover available storage resource types"
+      ansible.builtin.set_fact:
+        has_fsi_crd: "{{ storage_crds.results[0].stdout | trim | length > 0 }}"
+        has_storagecluster_crd: "{{ storage_crds.results[1].stdout | trim | length > 0 }}"
+        has_localvolumeset_crd: "{{ storage_crds.results[2].stdout | trim | length > 0 }}"
+
+    - name: "18 | Look up Data Foundation service instance"
+      ansible.builtin.command:
+        argv: [oc, get, fusionserviceinstance, odfmanager, -n, ibm-spectrum-fusion-ns, -o, json, --ignore-not-found]
+      register: odfmanager_lookup
+      when: has_fsi_crd | bool
+      changed_when: false
+
+    - name: "18 | Look up Ceph StorageCluster"
+      ansible.builtin.command:
+        argv: [oc, get, storagecluster, ocs-storagecluster, -n, openshift-storage, -o, json, --ignore-not-found]
+      register: storagecluster_lookup
+      when: has_storagecluster_crd | bool
+      changed_when: false
+
+    - name: "18 | Look up local Ceph disk selection"
+      ansible.builtin.command:
+        argv: [oc, get, localvolumeset, fusion-ceph-disks, -n, openshift-local-storage, -o, json, --ignore-not-found]
+      register: localvolumeset_lookup
+      when: has_localvolumeset_crd | bool
+      changed_when: false
+
+    - name: "18 | Look up default Ceph block StorageClass"
+      ansible.builtin.command:
+        argv: [oc, get, storageclass, ocs-storagecluster-ceph-rbd, -o, json, --ignore-not-found]
+      register: ceph_storageclass_lookup
+      changed_when: false
+
+    - name: "19 | Record detected storage resources"
+      ansible.builtin.set_fact:
+        odfmanager_exists: "{{ odfmanager_lookup.stdout | default('') | trim | length > 0 }}"
+        storagecluster_exists: "{{ storagecluster_lookup.stdout | default('') | trim | length > 0 }}"
+        localvolumeset_exists: "{{ localvolumeset_lookup.stdout | default('') | trim | length > 0 }}"
+        ceph_storageclass_exists: "{{ ceph_storageclass_lookup.stdout | trim | length > 0 }}"
+
+    - name: "19 | Report Data Foundation and Ceph inventory"
+      ansible.builtin.debug:
+        msg: >-
+          READ-ONLY: Data Foundation service={{ 'found' if odfmanager_exists else 'not found' }},
+          Ceph StorageCluster={{ 'found' if storagecluster_exists else 'not found' }},
+          local disk selection={{ 'found' if localvolumeset_exists else 'not found' }},
+          Ceph block StorageClass={{ 'found' if ceph_storageclass_exists else 'not found' }}.
+
+    - name: "20 | Verify existing Data Foundation service is complete"
+      ansible.builtin.assert:
+        that:
+          - odfmanager_spec.serviceDefinition == 'data-foundation-service'
+          - (odfmanager_spec.parameters | selectattr('name', 'equalto', 'backingStorageType')
+             | map(attribute='value') | first | default('')) == 'Local'
+          - odfmanager_conditions | selectattr('type', 'equalto', 'Installing')
+            | selectattr('status', 'equalto', 'False') | list | length > 0
+          - odfmanager_conditions | selectattr('type', 'equalto', 'Error')
+            | selectattr('status', 'equalto', 'True') | list | length == 0
+        success_msg: "PASS - Data Foundation local-storage service installation completed"
+        fail_msg: "Data Foundation service exists but is not in the expected completed state"
+      vars:
+        odfmanager_obj: "{{ odfmanager_lookup.stdout | from_json }}"
+        odfmanager_spec: "{{ odfmanager_obj.spec }}"
+        odfmanager_conditions: "{{ odfmanager_obj.status.conditions | default([]) }}"
+      when: odfmanager_exists | bool
+
+    - name: "20 | Verify existing Ceph StorageCluster is Ready"
+      ansible.builtin.assert:
+        that:
+          - ceph_storagecluster.status.phase | default('') == 'Ready'
+        success_msg: >-
+          PASS - Ceph StorageCluster Ready; profile={{ ceph_storagecluster.spec.resourceProfile | default('unknown') }};
+          storage devices={{ ceph_storagecluster.spec.storageDeviceSets | default([]) | length }} set(s)
+        fail_msg: "Ceph StorageCluster exists but its phase is not Ready"
+      vars:
+        ceph_storagecluster: "{{ storagecluster_lookup.stdout | from_json }}"
+      when: storagecluster_exists | bool
+
+    - name: "20 | Report existing local disk selection"
+      ansible.builtin.debug:
+        msg: >-
+          PASS - LocalVolumeSet {{ localvolume.metadata.name }} uses {{ localvolume.spec.storageClassName }};
+          minimum disk size={{ localvolume.spec.deviceInclusionSpec.minSize | default('not specified') }};
+          maximum disks/node={{ localvolume.spec.maxDeviceCount | default('not specified') }}.
+          Future deployments must discover appropriate nodes and unused disks, not copy TechZone hostnames.
+      vars:
+        localvolume: "{{ localvolumeset_lookup.stdout | from_json }}"
+      when: localvolumeset_exists | bool
+
+    - name: "21 | Data Foundation inventory complete"
+      ansible.builtin.debug:
+        msg: "PASS - Phase 4 inventory completed without modifying storage. Deployment logic remains disabled/not implemented."
+
+    - name: "99 | Completion"
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Operator stage finished' if install_operators | bool else 'Preflight and inventory finished' }}.
+          {{ 'Fusion initialization was explicitly requested' if initialize_fusion | bool else 'Fusion initialization remained disabled (read-only).' }}
+          Phase 4 inventoried Data Foundation and local storage without modifying them.

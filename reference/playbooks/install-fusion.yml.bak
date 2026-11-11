@@ -1,0 +1,104 @@
+---
+- name: IBM Fusion Automated Installation
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    operator_packages:
+      - package: isf-operator
+        catalog: ibm-operator-catalog
+        channel: v2.0
+      - package: local-storage-operator
+        catalog: redhat-operators
+        channel: stable
+
+  tasks:
+    - name: "01 | Verify OpenShift authentication"
+      ansible.builtin.command: oc whoami
+      register: identity
+      changed_when: false
+
+    - name: "01 | Authentication result"
+      ansible.builtin.debug:
+        msg: "PASS - Connected as {{ identity.stdout }}"
+
+    - name: "02 | Check OpenShift version"
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - clusterversion
+          - version
+          - -o
+          - 'jsonpath={.status.desired.version}'
+      register: ocp_version
+      changed_when: false
+
+    - name: "02 | Validate OpenShift compatibility"
+      ansible.builtin.assert:
+        that:
+          - ocp_version.stdout is match('^4[.]21[.]')
+        success_msg: "PASS - OpenShift {{ ocp_version.stdout }}"
+        fail_msg: "FAIL - Expected OpenShift 4.21"
+
+    - name: "03 | Wait for OpenShift nodes"
+      ansible.builtin.command:
+        argv:
+          - oc
+          - wait
+          - node
+          - --all
+          - --for=condition=Ready
+          - --timeout=120s
+      changed_when: false
+
+    - name: "03 | Discover cluster nodes"
+      ansible.builtin.command:
+        argv: [oc, get, nodes, -o, json]
+      register: nodes
+      changed_when: false
+
+    - name: "03 | Validate node count"
+      ansible.builtin.assert:
+        that:
+          - ((nodes.stdout | from_json)['items'] | length) >= 3
+        success_msg: >-
+          PASS - {{ (nodes.stdout | from_json)['items'] | length }}
+          OpenShift nodes Ready
+        fail_msg: "FAIL - At least 3 nodes required"
+
+    - name: "04 | Discover required Operator packages"
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - packagemanifest
+          - "{{ item.package }}"
+          - -n
+          - openshift-marketplace
+          - -o
+          - json
+      loop: "{{ operator_packages }}"
+      register: packages
+      changed_when: false
+
+    - name: "04 | Validate Operator catalogs and channels"
+      ansible.builtin.assert:
+        that:
+          - (item.stdout | from_json).status.catalogSource == item.item.catalog
+          - (item.stdout | from_json).status.defaultChannel == item.item.channel
+        success_msg: >-
+          PASS - {{ item.item.package }}
+          available from {{ item.item.catalog }}
+        fail_msg: >-
+          FAIL - {{ item.item.package }}
+          catalog or channel mismatch
+      loop: "{{ packages.results }}"
+      loop_control:
+        label: "{{ item.item.package }}"
+
+    - name: "05 | Preflight complete"
+      ansible.builtin.debug:
+        msg: "PASS - Fusion installation prerequisites verified. No resources modified."

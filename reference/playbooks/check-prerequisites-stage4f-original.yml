@@ -1,0 +1,213 @@
+---
+# IBM Fusion 2.14.x - Phase 4F: read-only installation prerequisite audit.
+# This playbook NEVER creates, edits, or deletes cluster resources.
+# Tested baseline: OpenShift 4.21.24; intended to be useful on a future fresh cluster.
+# It checks observable prerequisites only. It cannot prove IBM entitlement,
+# registry reachability, image pull success, or usable storage capacity.
+- name: "Phase 4F | Read-only IBM Fusion installation prerequisites"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    required_catalogs:
+      - ibm-operator-catalog
+      - redhat-operators
+
+  tasks:
+    - name: "00 | Reject deployment or manifest-generation flags"
+      ansible.builtin.assert:
+        that:
+          - not (install_operators | default(false) | bool)
+          - not (initialize_fusion | default(false) | bool)
+          - not (accept_ibm_license | default(false) | bool)
+          - not (generate_manifest | default(false) | bool)
+          - not (run_persistence_test | default(false) | bool)
+        success_msg: "PASS - Read-only prerequisites audit"
+        fail_msg: "STOP - This audit may not run with deployment switches enabled"
+
+    - name: "01 | Verify OpenShift authentication"
+      ansible.builtin.command:
+        argv: [oc, whoami]
+      register: phase4f_identity
+      changed_when: false
+
+    - name: "01 | Check cluster-wide administrative access"
+      ansible.builtin.command:
+        argv: [oc, auth, can-i, '*', '*', --all-namespaces]
+      register: phase4f_access
+      changed_when: false
+      failed_when: false
+
+    - name: "01 | Report permission status"
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'PASS' if phase4f_access.stdout | trim == 'yes' else 'REVIEW' }} -
+          User={{ phase4f_identity.stdout }};
+          cluster-wide administrative permission={{ phase4f_access.stdout | trim | default('unknown', true) }}.
+          Fresh installation needs sufficient privileges.
+
+    - name: "02 | Inspect OpenShift version"
+      ansible.builtin.command:
+        argv: [oc, get, clusterversion, version, -o, json]
+      register: phase4f_version_cmd
+      changed_when: false
+
+    - name: "02 | Inspect cluster nodes"
+      ansible.builtin.command:
+        argv: [oc, get, nodes, -o, json]
+      register: phase4f_nodes_cmd
+      changed_when: false
+
+    - name: "02 | Parse cluster inventory"
+      ansible.builtin.set_fact:
+        phase4f_version: "{{ (phase4f_version_cmd.stdout | from_json).status.desired.version }}"
+        phase4f_nodes: "{{ (phase4f_nodes_cmd.stdout | from_json)['items'] }}"
+
+    - name: "02 | Require at least three nodes"
+      ansible.builtin.assert:
+        that:
+          - phase4f_nodes | length >= 3
+        success_msg: "PASS - Found {{ phase4f_nodes | length }} cluster nodes"
+        fail_msg: "FAIL - Fewer than three cluster nodes; review Data Foundation topology"
+
+    - name: "02 | Check node readiness"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (item.status.conditions | selectattr('type', 'equalto', 'Ready') |
+             map(attribute='status') | first | default('Unknown')) == 'True'
+        success_msg: "PASS - {{ item.metadata.name }} Ready"
+        fail_msg: "FAIL - {{ item.metadata.name }} not Ready"
+      loop: "{{ phase4f_nodes }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: "02 | Report tested-version boundary"
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'PASS' if phase4f_version is match('^4[.]21[.]') else 'REVIEW' }} -
+          OpenShift={{ phase4f_version }}. Current lab-tested baseline is 4.21.x;
+          verify version-specific IBM Fusion support before a new installation.
+
+    - name: "03 | Read OpenShift ClusterOperator status"
+      ansible.builtin.command:
+        argv: [oc, get, clusteroperators, -o, json]
+      register: phase4f_co_cmd
+      changed_when: false
+
+    - name: "03 | Initialize unhealthy Operator list"
+      ansible.builtin.set_fact:
+        phase4f_unhealthy_co: []
+
+    - name: "03 | Identify unavailable or degraded ClusterOperators"
+      ansible.builtin.set_fact:
+        phase4f_unhealthy_co: "{{ phase4f_unhealthy_co + [item.metadata.name] }}"
+      vars:
+        conditions: "{{ item.status.conditions | default([]) }}"
+        available: "{{ conditions | selectattr('type', 'equalto', 'Available') | map(attribute='status') | first | default('Unknown') }}"
+        degraded: "{{ conditions | selectattr('type', 'equalto', 'Degraded') | map(attribute='status') | first | default('Unknown') }}"
+      when: available != 'True' or degraded == 'True'
+      loop: "{{ (phase4f_co_cmd.stdout | from_json)['items'] }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: "03 | Report OpenShift Operator health"
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'PASS' if phase4f_unhealthy_co | length == 0 else 'REVIEW' }} -
+          ClusterOperators requiring attention:
+          {{ phase4f_unhealthy_co | join(', ') if phase4f_unhealthy_co | length else 'none' }}.
+
+    - name: "04 | Read installed Operator catalogs"
+      ansible.builtin.command:
+        argv: [oc, get, catalogsources, -n, openshift-marketplace, -o, json]
+      register: phase4f_catalog_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: "04 | Extract catalog names"
+      ansible.builtin.set_fact:
+        phase4f_catalog_names: >-
+          {{ ((phase4f_catalog_cmd.stdout | from_json)['items'] |
+               map(attribute='metadata.name') | list)
+             if phase4f_catalog_cmd.rc == 0 else [] }}
+
+    - name: "04 | Report required catalog presence"
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'PASS' if item in phase4f_catalog_names else 'SETUP NEEDED' }} -
+          {{ item }} {{ 'present' if item in phase4f_catalog_names else 'missing' }}
+          in openshift-marketplace.
+      loop: "{{ required_catalogs }}"
+
+    - name: "04 | Probe IBM Fusion and Local Storage package manifests"
+      ansible.builtin.command:
+        argv: [oc, get, packagemanifest, "{{ item }}", -n, openshift-marketplace, -o, name]
+      register: phase4f_package_checks
+      changed_when: false
+      failed_when: false
+      loop:
+        - isf-operator
+        - local-storage-operator
+
+    - name: "04 | Report available Operator packages"
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'PASS' if item.rc == 0 else 'SETUP NEEDED' }} -
+          {{ item.item }} package {{ 'discoverable' if item.rc == 0 else 'not currently discoverable' }}.
+      loop: "{{ phase4f_package_checks.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: "05 | Read StorageClasses"
+      ansible.builtin.command:
+        argv: [oc, get, storageclasses, -o, json]
+      register: phase4f_sc_cmd
+      changed_when: false
+
+    - name: "05 | Parse StorageClasses"
+      ansible.builtin.set_fact:
+        phase4f_sc_items: "{{ (phase4f_sc_cmd.stdout | from_json)['items'] }}"
+        phase4f_default_sc: []
+
+    - name: "05 | Identify explicitly default StorageClasses"
+      ansible.builtin.set_fact:
+        phase4f_default_sc: "{{ phase4f_default_sc + [item.metadata.name] }}"
+      when: >-
+        (item.metadata.annotations | default({})).get('storageclass.kubernetes.io/is-default-class', 'false') == 'true'
+        or (item.metadata.annotations | default({})).get('storageclass.beta.kubernetes.io/is-default-class', 'false') == 'true'
+      loop: "{{ phase4f_sc_items }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: "05 | Report StorageClass inventory"
+      ansible.builtin.debug:
+        msg:
+          - "StorageClasses: {{ phase4f_sc_items | map(attribute='metadata.name') | join(', ') if phase4f_sc_items | length else 'none' }}"
+          - "Default-class annotation candidates: {{ phase4f_default_sc | join(', ') if phase4f_default_sc | length else 'none / not proven' }}"
+          - "REVIEW - StorageClass presence does NOT prove a suitable RWO class has adequate free capacity. Validate separately before Fusion installation."
+
+    - name: "06 | Check OpenShift global pull-secret existence only (never read secret data)"
+      ansible.builtin.command:
+        argv: [oc, get, secret, pull-secret, -n, openshift-config, -o, name]
+      register: phase4f_pull_secret
+      changed_when: false
+      failed_when: false
+
+    - name: "06 | Report registry preparation limits"
+      ansible.builtin.debug:
+        msg:
+          - >-
+            {{ 'PASS' if phase4f_pull_secret.rc == 0 else 'SETUP NEEDED' }} -
+            OpenShift global pull-secret object
+            {{ 'exists' if phase4f_pull_secret.rc == 0 else 'not found' }} (contents not accessed).
+          - "NOT VERIFIED - IBM entitlement validity, entitlement scope, and actual image pull from cp.icr.io."
+          - "NOT VERIFIED - Network/proxy allowlists, DNS, and registry connectivity from cluster nodes."
+
+    - name: "99 | Finish read-only prerequisites assessment"
+      ansible.builtin.debug:
+        msg:
+          - "PASS - Completed read-only Phase 4F audit. No manifests or cluster objects changed."
+          - "NOTE - This is an inventory/preflight report, NOT a certification that a fresh installation is ready."
+          - "REVIEW - Before first install: IBM 2.14.x support matrix, CPU/RAM and storage sizing, 3 appropriate storage nodes, IBM registry entitlement, and deployment order."
