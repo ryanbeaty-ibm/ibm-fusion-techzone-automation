@@ -68,15 +68,20 @@
           - "((node_info['items'] | selectattr('metadata.name', 'equalto', item) | first).status.conditions | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | first) == 'True'"
       loop: '{{ scale_nodes }}'
 
+    # Iterate over names rather than full Kubernetes Node objects: Ansible
+    # includes the loop item in task output and Node objects can be megabytes.
     - name: Ensure no unselected node already has the scale role
       ansible.builtin.assert:
         that:
-          - "'node-role.kubernetes.io/scale' not in item.metadata.labels"
+          - >-
+            'node-role.kubernetes.io/scale' not in
+            ((node_info['items'] | selectattr('metadata.name', 'equalto', item)
+              | first).metadata.labels | default({}))
         fail_msg: 'An unselected node is labeled scale; refusing to change the pool.'
-      loop: "{{ node_info['items'] }}"
+      loop: "{{ node_info['items'] | map(attribute='metadata.name') | list }}"
       loop_control:
-        label: '{{ item.metadata.name }}'
-      when: item.metadata.name not in scale_nodes
+        label: '{{ item }}'
+      when: item not in scale_nodes
 
     - name: Inspect current MachineConfigPools
       ansible.builtin.command:

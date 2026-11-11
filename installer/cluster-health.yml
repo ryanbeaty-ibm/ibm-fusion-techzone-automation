@@ -1,0 +1,115 @@
+---
+- name: IBM Fusion TechZone | Read-only OpenShift cluster readiness gate
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Require explicitly selected Lab 01 target
+      ansible.builtin.assert:
+        that:
+          - lab_preflight_kubeconfig is defined
+          - lab_preflight_cluster is defined
+          - lab_preflight_api is defined
+          - lab_preflight_cluster is match('^itz-[a-z0-9-]+$')
+          - lab_preflight_api is match('^https://api\\.itz-[a-z0-9.-]+\\.techzone\\.ibm\\.com:6443$')
+        fail_msg: 'Missing or invalid explicit TechZone preflight parameters.'
+        quiet: true
+
+    - name: Get ClusterVersion state
+      ansible.builtin.command:
+        argv:
+          - oc
+          - '--kubeconfig={{ lab_preflight_kubeconfig }}'
+          - get
+          - clusterversion
+          - version
+          - -o
+          - json
+      register: cv_raw
+      changed_when: false
+
+    - name: Require fully reconciled OpenShift 4.21 cluster
+      ansible.builtin.assert:
+        that:
+          - "(cv.status.desired.version | default('')) is match('^4\\.21\\.')"
+          - "(cv.status.conditions | default([]) | selectattr('type', 'equalto', 'Available') | selectattr('status', 'equalto', 'True') | list | length) == 1"
+          - "(cv.status.conditions | default([]) | selectattr('type', 'equalto', 'Progressing') | selectattr('status', 'equalto', 'False') | list | length) == 1"
+          - "(cv.status.conditions | default([]) | selectattr('type', 'equalto', 'Failing') | selectattr('status', 'equalto', 'False') | list | length) == 1"
+        fail_msg: 'OpenShift ClusterVersion is not fully available (check oc get clusterversion).'
+        quiet: true
+      vars:
+        cv: "{{ cv_raw.stdout | from_json }}"
+
+    - name: Get all ClusterOperators
+      ansible.builtin.command:
+        argv:
+          - oc
+          - '--kubeconfig={{ lab_preflight_kubeconfig }}'
+          - get
+          - clusteroperators
+          - -o
+          - json
+      register: co_raw
+      changed_when: false
+
+    - name: Refuse missing ClusterOperator inventory
+      ansible.builtin.assert:
+        that:
+          - "((co_raw.stdout | from_json)['items'] | length) > 0"
+        quiet: true
+
+    - name: Require every ClusterOperator Available and not Progressing or Degraded
+      ansible.builtin.assert:
+        that:
+          - "(item.status.conditions | default([]) | selectattr('type', 'equalto', 'Available') | selectattr('status', 'equalto', 'True') | list | length) == 1"
+          - "(item.status.conditions | default([]) | selectattr('type', 'equalto', 'Progressing') | selectattr('status', 'equalto', 'False') | list | length) == 1"
+          - "(item.status.conditions | default([]) | selectattr('type', 'equalto', 'Degraded') | selectattr('status', 'equalto', 'False') | list | length) == 1"
+        fail_msg: 'ClusterOperator {{ item.metadata.name }} is not fully healthy; run oc describe co {{ item.metadata.name }}.'
+        quiet: true
+      loop: "{{ (co_raw.stdout | from_json)['items'] }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: Get MachineConfigPools
+      ansible.builtin.command:
+        argv:
+          - oc
+          - '--kubeconfig={{ lab_preflight_kubeconfig }}'
+          - get
+          - machineconfigpools
+          - -o
+          - json
+      register: mcp_raw
+      changed_when: false
+
+    - name: Require master and worker MachineConfigPools
+      ansible.builtin.assert:
+        that:
+          - "'master' in ((mcp_raw.stdout | from_json)['items'] | map(attribute='metadata.name') | list)"
+          - "'worker' in ((mcp_raw.stdout | from_json)['items'] | map(attribute='metadata.name') | list)"
+        fail_msg: 'Expected master and worker MachineConfigPools are missing.'
+        quiet: true
+
+    - name: Require all existing MachineConfigPools updated and not degraded
+      ansible.builtin.assert:
+        that:
+          - "(item.status.machineCount | int) > 0"
+          - "(item.status.readyMachineCount | int) == (item.status.machineCount | int)"
+          - "(item.status.updatedMachineCount | int) == (item.status.machineCount | int)"
+          - "(item.status.degradedMachineCount | int) == 0"
+          - "(item.status.conditions | default([]) | selectattr('type', 'equalto', 'Updated') | selectattr('status', 'equalto', 'True') | list | length) == 1"
+          - "(item.status.conditions | default([]) | selectattr('type', 'equalto', 'Updating') | selectattr('status', 'equalto', 'False') | list | length) == 1"
+          - "(item.status.conditions | default([]) | selectattr('type', 'equalto', 'Degraded') | selectattr('status', 'equalto', 'False') | list | length) == 1"
+        fail_msg: 'MachineConfigPool {{ item.metadata.name }} is not fully reconciled; run oc get mcp.'
+        quiet: true
+      loop: "{{ (mcp_raw.stdout | from_json)['items'] }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: Report fully healthy OpenShift cluster
+      ansible.builtin.debug:
+        msg: >-
+          PASS: All ClusterOperators Available/not Progressing/not Degraded;
+          all existing MachineConfigPools fully Updated/Ready;
+          OpenShift 4.21 is Available/not Progressing/not Failing.
+          No OpenShift resources modified.

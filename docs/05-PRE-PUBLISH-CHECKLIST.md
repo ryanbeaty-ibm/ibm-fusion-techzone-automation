@@ -1,6 +1,6 @@
 # 05 — Before publishing to GitHub
 
-**v2.1 candidate:** The installer now prompts for the Scale GUI username and hidden password and encrypts them with Ansible Vault outside the project. There is no hardcoded Scale GUI password in the shipped playbook. Before publishing, audit your entire Git working tree and history for secrets and verify the Vault flow on a new lab.
+**v2.3 candidate:** The installer now prompts for the Scale GUI username and hidden password and encrypts them with Ansible Vault outside the project. There is no hardcoded Scale GUI password in the shipped playbook. Before publishing, audit your entire Git working tree and history for secrets and verify the Vault flow on a new lab.
 
 ## Release checklist
 
@@ -11,13 +11,13 @@
 - [ ] Do not publish IBM course PDFs, proprietary templates, or other third-party copyrighted materials unless you have redistribution rights.
 - [ ] Add an explicit license for **your original automation** only after choosing the appropriate terms; do not claim ownership of IBM intellectual property.
 - [ ] Explain that the scripts are intended for disposable TechZone labs, not production.
-- [ ] Do not claim the v2.1 single-command installer is validated until the fresh-lab test passes; record the new cluster and outcome in a sanitized release note.
+- [ ] Preserve the v2.2 live validation record and **test v2.3 independently** before labeling the new version field-validated.
 - [ ] Review the `reference/` archive: historical scripts may contain stale cluster names and should not be executed directly.
 - [ ] Validate the README commands from a clean checkout.
 
-## Local secret management plan (to implement before publication)
+## Secret handling currently implemented
 
-For disposable private lab use, credentials can remain in a local ignored variables file, e.g. `config/local/scale-secrets.yml`, supplied to the remote-connection playbook without being committed. Prefer Ansible Vault or an environment-backed secret for broader sharing. The v2.1 installer supports a per-cluster encrypted Ansible Vault variables file; its randomly generated unlock key is stored separately outside the repository. Both stay private. Verify the GitHub tree and history contain neither file.
+The launcher uses encrypted Ansible Vault variables and a locally stored unlock key outside the repository. These files must not be committed. Review the Git history before publication; encryption and `.gitignore` do not undo any previous disclosure.
 
 ## Suggested GitHub repository description
 

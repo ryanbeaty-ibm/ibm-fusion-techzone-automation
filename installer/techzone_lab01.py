@@ -18,11 +18,12 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import textwrap
 
 HERE = pathlib.Path(__file__).resolve().parent.parent
 REFERENCE = HERE / 'reference'
-RELEASE = '2.1.0'
+RELEASE = '2.3.0'
 STAGES = (
     'fusion-ceph',
     'ceph-io-test',
@@ -291,6 +292,27 @@ def configure_scale_vault(cluster, update=False):
     return vault_file, key_file
 
 
+def run_cluster_health_gate(params, directory):
+    """Execute read-only Ansible readiness checks before any installer writes."""
+    if shutil.which('ansible-playbook') is None:
+        stop('ansible-playbook is required for the automatic cluster health preflight.')
+    playbook = HERE / 'installer' / 'cluster-health.yml'
+    if not playbook.is_file():
+        stop(f'Missing cluster health preflight: {playbook}')
+    argv = ['ansible-playbook', '-i', 'localhost,', str(playbook),
+            '-e', f"lab_preflight_kubeconfig={params['kubeconfig']}",
+            '-e', f"lab_preflight_cluster={params['cluster']}",
+            '-e', f"lab_preflight_api={params['api']}"]
+    print('=== Automatic read-only OpenShift health preflight (Ansible) ===', flush=True)
+    env = dict(os.environ, KUBECONFIG=params['kubeconfig'])
+    result = subprocess.run(argv, cwd=HERE, env=env, check=False)
+    if result.returncode:
+        stop('Read-only OpenShift preflight FAILED; not installing anything. '
+             'Review the failing ClusterOperator/MachineConfigPool and rerun after recovery.')
+    print('PASS: OpenShift readiness gate. Disk eligibility is checked immediately before Ceph claims; '
+          'Scale connectivity is verified during the external connection stage.', flush=True)
+
+
 def steps():
     def ans(playbook, *extras):
         config = 'config/local/lab01-scale-external.yml' if ('remote' in playbook or 'filesystem' in playbook) else 'config/local/lab01-scale-client.yml'
@@ -322,6 +344,7 @@ def execute(params, directory, start_stage, vault=None):
         stop('Ansible and jq are required on the Ubuntu automation server.')
     log_path = directory / 'logs' / f"install-{datetime.datetime.now(datetime.timezone.utc):%Y%m%dT%H%M%SZ}.log"
     print(f'DEPLOYMENT LOG: {log_path}', flush=True)
+    started = time.monotonic()
     env = dict(os.environ, KUBECONFIG=params['kubeconfig'])
     if vault:
         env['FUSION_SCALE_VAULT_VARS_FILE'] = str(vault[0])
@@ -344,6 +367,7 @@ def execute(params, directory, start_stage, vault=None):
             return proc.wait()
     begin = STAGES.index(start_stage)
     for stage in STAGES[begin:]:
+        stage_started = time.monotonic()
         for part in steps()[stage]:
             attempts = 3 if stage == 'scale-operator' else 1
             for n in range(1, attempts + 1):
@@ -351,15 +375,24 @@ def execute(params, directory, start_stage, vault=None):
                 if rc == 0:
                     break
                 if n < attempts:
-                    print(f'Operator readiness not yet settled; retrying the SAME activation step in 30s ({n}/{attempts}).', flush=True)
-                    import time
+                    print(f'Scale operator activation exited with rc={rc}; retrying this same stage in 30s ({n}/{attempts}).', flush=True)
                     time.sleep(30)
             if rc:
                 stop(f'Stage {stage} failed (rc={rc}). See {log_path}. '
                      f'Resume using --from {stage} after correcting the cause.')
-        print(f'PASS: {stage}', flush=True)
-    print('PASS: ALL LAB 01 INSTALLATION AND STORAGE TEST STAGES.', flush=True)
+        stage_elapsed = time.monotonic() - stage_started
+        summary = f'PASS: {stage} (elapsed {int(stage_elapsed // 60)}m {int(stage_elapsed % 60):02d}s)'
+        print(summary, flush=True)
+        with log_path.open('a') as out:
+            out.write(summary + '\n')
+    total = time.monotonic() - started
+    summary = 'PASS: ALL LAB 01 INSTALLATION AND STORAGE TEST STAGES.'
+    print(summary, flush=True)
+    print(f'DEPLOYMENT ELAPSED: {int(total // 60)}m {int(total % 60):02d}s (excludes preflight and credential entry)', flush=True)
     print('The remote IBM Storage Scale server was never installed or rebuilt by this workflow.', flush=True)
+    with log_path.open('a') as out:
+        out.write(summary + '\n')
+        out.write(f'DEPLOYMENT ELAPSED: {int(total // 60)}m {int(total % 60):02d}s\n')
 
 
 def parse(argv):
@@ -389,6 +422,7 @@ def main():
     args = parse(sys.argv[1:])
     params = validate_cluster(args)
     folder = workspace(params)
+    run_cluster_health_gate(params, folder)
     print(f"TARGET: {params['cluster']} @ {params['api']} | OCP {params['version']} | user {params['whoami']}")
     print('NODES: 3 masters + 3 Ceph infra + 3 Scale application workers.')
     print(f"Ceph disk: {params['ceph_disk']} (explicit claim) | Pre-deployed remote Scale: {params['scale_host']}:443 / fs1")

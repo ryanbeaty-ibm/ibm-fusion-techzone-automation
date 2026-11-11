@@ -1,15 +1,13 @@
 # 03 — Troubleshooting and safe recovery
 
-Use the **first failing stage**, not just the final application pod's status. This project is designed to stop when a prerequisite is missing.
+Use the **first permanently failing stage**, not just expected transient `FAILED - RETRYING` wait messages or the final application pod's status. This project is designed to stop when a prerequisite is missing.
 
 | Symptom | Likely diagnosis / next step |
 |---|---|
-| New reservation shows all nine nodes Ready but ClusterVersion reports Console unavailable | Inspect `oc get co`, `oc get pods -n openshift-console`, `oc get mcp`, and `oc get clusterversion`. Wait for Console and other ClusterOperators to settle; do not start Fusion installation early. |
-| `kube-apiserver` remains Progressing | Run `oc wait co/kube-apiserver --for=condition=Progressing=False --timeout=10m`, then inspect all operators, MachineConfigPools, and ClusterVersion again. This wait is not a full-cluster health check. |
 | `oc` cannot authenticate or wrong cluster | Verify the explicit kubeconfig path, `oc whoami`, API endpoint, node prefix, and nine-node inventory. |
 | Fusion/ODF stage errors | Capture the first failing Ansible task and the associated operator/StorageCluster conditions. Do not delete a StorageCluster to retry. |
 | Scale MCP remains Updating | MachineConfig changes may reboot selected worker nodes. Check `oc get mcp` and node readiness; Ceph infra nodes are deliberately separate. |
-| Scale Operator CSV is `Succeeded`, but Deployment shows `0/0` | The Operator has been installed but controller replicas may be deliberately zero. The activation playbook changes this; confirm it reaches 1/1 before continuing. |
+| Scale Operator CSV is `Succeeded`, but Deployment shows `0/0` or transient `0/1` | The operator may start at zero replicas. The activation playbook switches to one and waits up to 15 minutes for a ready replica. If the wait times out, inspect the controller Deployment and pods before resuming. |
 | Scale core pods are not Ready | Check `oc -n ibm-spectrum-scale get pods -o wide` and core-pod diagnostics before proceeding to RemoteCluster. |
 | Remote server connection fails | Verify that the current TechZone reservation has the expected **pre-deployed** server, network reachability, GUI user privileges, certificate handling, and its existing filesystem `fs1`. A `401` with no authentication during connectivity probing only proves the endpoint responded. |
 | PVC remains Pending, writer pod unschedulable | Investigate `oc describe pvc`, CSI provisioner logs and StorageClass parameters. The pod's `unbound immediate PersistentVolumeClaims` message is a consequence, not root cause. |

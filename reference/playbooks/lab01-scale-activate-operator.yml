@@ -97,6 +97,21 @@
           - --timeout=900s
       changed_when: false
 
+    # OLM may report the rollout complete briefly before readyReplicas is populated.
+    # Wait in one oc invocation rather than immediately firing a FAILED assertion.
+    - name: Wait for one ready Scale operator replica (up to 15 minutes)
+      ansible.builtin.command:
+        argv:
+          - oc
+          - '--kubeconfig={{ kubeconfig }}'
+          - -n
+          - '{{ scale_namespace }}'
+          - wait
+          - 'deployment/{{ scale_operator_deployment }}'
+          - '--for=jsonpath={.status.readyReplicas}=1'
+          - --timeout=900s
+      changed_when: false
+
     - name: Inspect operator deployment after activation
       ansible.builtin.command:
         argv: [oc, '--kubeconfig={{ kubeconfig }}', -n, '{{ scale_namespace }}', get, deploy, '{{ scale_operator_deployment }}', -o, json]

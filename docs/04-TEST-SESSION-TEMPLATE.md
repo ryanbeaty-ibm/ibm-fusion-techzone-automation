@@ -3,7 +3,7 @@
 Copy this file to a new document for **each** TechZone deployment. Do **not** save private kubeconfig files, passwords, tokens, or unredacted logs in Git.
 
 **Test date (UTC):** TBD  
-**Installer version:** 2.1 (unless changed)  
+**Installer version:** 2.3.0 (change if testing another release)  
 **Git revision:** TBD  
 **TechZone cluster prefix:** TBD  
 **OpenShift version:** TBD  
@@ -17,13 +17,8 @@ Copy this file to a new document for **each** TechZone deployment. Do **not** sa
 - [ ] Kubeconfig downloaded, transferred, restricted with `chmod 600`
 - [ ] `oc whoami` and API endpoint verified
 - [ ] Exactly nine expected nodes all Ready
-- [ ] `oc get co`: every ClusterOperator Available=True, Progressing=False, Degraded=False
-- [ ] `oc get clusterversion`: Available=True, Progressing=False (expected OpenShift 4.21.x)
-- [ ] `oc get mcp`: master and worker pools Updated=True, Updating=False, Degraded=False, ready/updated counts match machine counts
-- [ ] Console pods running; `kube-apiserver` no longer progressing
-- [ ] Automated read-only health gate reports PASS
 - [ ] Confirmed selected local disks are unused and safe to claim
-- [ ] v2.1 `plan` succeeded without cluster modifications
+- [ ] v2.3 `plan` succeeded without cluster modifications
 
 ## Deployment outcomes
 

@@ -2,7 +2,7 @@
 
 ## Known prior result
 
-The previous `itz-s6fyum` lab completed the **v1.4.2** Fusion/Ceph/Scale installation and the final Scale 16 MiB write/remount/SHA-256 test on 2026-11-11. It used a pre-deployed external Scale server, not a new Scale storage server installed by Ansible.
+The new November 11, 2026 TechZone cluster completed the **v2.2** one-command Fusion/Ceph/Scale deployment and both 16 MiB write/remount/SHA-256 tests. See the [validation record](06-LIVE-VALIDATION-2026-11-11.md). It used a pre-deployed external Scale server, not a new Scale storage server installed by Ansible.
 
 ## Read-only verification commands on a new lab
 
@@ -42,7 +42,7 @@ The installer runs its own isolated checks, creating and deleting a temporary na
 - Scale CSI: PVC provisioned, writer wrote 16 MiB, reader remounted and verified the SHA-256 checksum, temporary namespace removed.
 - Final verification reported success; the installer printed `PASS: ALL LAB 01 INSTALLATION AND STORAGE TEST STAGES.`
 
-The local mounted Scale filesystem name follows the generated pattern `<cluster>-external-scale-fs1` in v2.1. The dynamic remote cluster ID must be discovered live; do not append it to the filesystem name for `volBackendFs`.
+The local mounted Scale filesystem name follows the generated pattern `<cluster>-external-scale-fs1` in v2.3. The dynamic remote cluster ID must be discovered live; do not append it to the filesystem name for `volBackendFs`.
 
 ## Lab versus full IBM course
 

@@ -1,133 +1,89 @@
-# IBM Fusion — Lab 01: Single-command TechZone installer (v2.1)
+# Start here — Lab 01 installer
 
-## Result from the completed lab
+The installer automates Fusion/Ceph installation, Scale client deployment, connection to the TechZone-provided external Scale server, and **both persistent-storage tests**. You do not need to run each playbook manually.
 
-The *installation/storage-validation portion* of IBM's **Installation and Configuration** lab passed on `itz-s6fyum` (OpenShift 4.21.24) on 11 November 2026:
+**Current release:** v2.3 cleanup candidate. The preceding v2.2 release passed a fresh-cluster end-to-end test on November 11, 2026. Read the [live validation record](docs/06-LIVE-VALIDATION-2026-11-11.md).
 
-- IBM Storage Fusion 2.14.1 and IBM Fusion Data Foundation/Ceph installed.
-- Three Ceph Object Storage Daemons (OSDs) Ready; 16 MiB Ceph block volume persisted across pod deletion and remount with matching SHA-256.
-- IBM Storage Scale Operator 60.1.0 activated, three prepared Scale workers and three Ready Scale core pods.
-- Pre-deployed external IBM Storage Scale server connected; remote `fs1` mounted as **`lab01-external-scale-fs1`**.
-- `fusionfs1` StorageClass corrected to **`volBackendFs: lab01-external-scale-fs1`**, the **local mounted filesystem name**, while `clusterId` is discovered live. Scale CSI PVC bound; 16 MiB written, remounted into a new pod, and checksum verified; test namespace cleaned up.
+## 1 — Download a fresh TechZone kubeconfig
 
-The final successful run was `bash scripts/lab01-scale-finish.sh finish` from v1.4.2. **That proves the current lab worked, not that this newly consolidated v2.1 entry point has been field-tested on a fresh cluster.** It needs a clean-room test on a future TechZone reservation.
+On your Windows computer, download the kubeconfig from your current IBM TechZone reservation. Rename it to a descriptive name such as `newlab.conf` and store it temporarily outside any Git repository. Record the new cluster prefix (`itz-...`), the **existing** external Scale server's management address and the disk assigned to Ceph on each infra node.
 
-## What you received
+## 2 — Transfer the kubeconfig using SecureCRT SFTP
 
-- `install-lab01.sh`: single command entry point, with `plan` and `deploy` actions.
-- `installer/techzone_lab01.py`: discovers and validates the **new** cluster's API, version, administrator, and EXACT node names; builds a separate pin-checked workspace; invokes the original successful stages in order and logs output.
-- `reference/`: read-only source copy of the uploaded working playbooks, scripts and templates, with the v1.4.2 StorageClass correction. The installer does not execute historical old-lab playbooks directly.
-- `docs/` and `.gitignore`: GitHub documentation and rules protecting runtime files from commits.
-- `work/<cluster-prefix>/`: generated automatically when running the command. The generated workspace is pinned to the actual kubeconfig/API and checked cluster. It is intentionally never overwritten if its settings change; this prevents accidental cross-cluster re-use.
+The following paths are examples from the tested Windows/Ubuntu setup. Adapt them to your machines.
 
-## Step 1 — SecureCRT SFTP (Windows)
+```text
+lcd D:\Dropbox\Fusion
+cd /home/automation/.kube
+put newlab.conf
+```
 
-Save `IBM-Fusion-Lab01-OneCommand-v2.1.zip` in `D:\Dropbox\Fusion` on your Windows computer. Paste these commands into **SecureCRT SFTP**:
+If the remote `.kube` folder does not exist, create it first in your **Ubuntu SSH** session:
+
+```bash
+mkdir -p "$HOME/.kube" && chmod 700 "$HOME/.kube"
+```
+
+Back in Ubuntu SSH:
+
+```bash
+chmod 600 "$HOME/.kube/newlab.conf"
+oc --kubeconfig="$HOME/.kube/newlab.conf" whoami
+oc --kubeconfig="$HOME/.kube/newlab.conf" whoami --show-server
+```
+
+The installer will perform its own node, OpenShift and ClusterOperator checks. You do **not** need to manually perform a long preflight checklist each time.
+
+## 3 — Transfer the release ZIP
+
+Place `IBM-Fusion-Lab01-OneCommand-v2.3.zip` in your Windows working folder and use SecureCRT SFTP:
 
 ```text
 lcd D:\Dropbox\Fusion
 cd /home/automation
-put IBM-Fusion-Lab01-OneCommand-v2.1.zip
+put IBM-Fusion-Lab01-OneCommand-v2.3.zip
 ```
 
-## Step 2 — Ubuntu SSH (Ansible server)
-
-Paste this into **Ubuntu SSH**, not the SFTP prompt:
+In Ubuntu SSH, extract into a **new versioned directory**, not the previously validated v2.2 workspace:
 
 ```bash
-mkdir -p ~/fusion-lab01-installer
-
-cd ~/fusion-lab01-installer
-
-unzip -o ~/IBM-Fusion-Lab01-OneCommand-v2.1.zip -d .
-
-ls -lah
+mkdir -p "$HOME/fusion-lab01-installer-v2.3"
+cd "$HOME/fusion-lab01-installer-v2.3"
+unzip -o "$HOME/IBM-Fusion-Lab01-OneCommand-v2.3.zip" -d .
 ```
 
-This prepares the installer only. Do **not** execute `deploy` until the new cluster's kubeconfig, disk selection, and Scale management IP have been verified.
+Alternatively, clone the GitHub repository onto Ubuntu and run the launcher from its root. Do not commit generated `work/` data.
 
-## Step 3 — Kubeconfig, prerequisites and cluster health
-
-Download the new TechZone kubeconfig to the Ubuntu server, keep it **outside** this project, and follow [docs/00-PREREQUISITES.md](docs/00-PREREQUISITES.md) for verification. **Run the read-only [OpenShift health gate](docs/01-FRESH-LAB-RUNBOOK.md#step-2--fresh-openshift-health-gate-read-only) before starting `plan` or `deploy`**. Nine Ready nodes alone do not mean a brand-new cluster has finished initializing.
-
-The target state is all ClusterOperators Available, not Progressing, not Degraded; master/worker MachineConfigPools Updated; and ClusterVersion Available without Progressing. This check was added after the clean TechZone reservation initially reported a transient Console Operator issue and a progressing Kubernetes API Server.
-
-### One deployment command for the NEXT clean TechZone lab
-
-**Replace the values** with the new reservation's cluster prefix, kubeconfig and Scale management IP. **Check that `/dev/vde` is the three disposable blank infrastructure disks on that reservation.**
+## 4 — Run `plan` (read-only to OpenShift)
 
 ```bash
-cd ~/fusion-lab01-installer
+bash install-lab01.sh plan \
+  --cluster itz-REPLACE_ME \
+  --kubeconfig "$HOME/.kube/newlab.conf" \
+  --scale-host REPLACE_WITH_EXISTING_SCALE_IP \
+  --ceph-disk /dev/vde
+```
+
+Replace **every** placeholder. `plan` pins the target API, checks nine nodes and runs the automatic Ansible cluster health gate. It creates local files, not cluster resources. It does **not** prove the selected disk is empty or that the Scale server is reachable; those are tested during deployment.
+
+## 5 — Deploy the entire lab with one command
+
+**Before running:** confirm the Ceph device on all three infra nodes is intended for destruction. The installer checks disk eligibility immediately before claims and stops on conflicts, but the operator must still supply the correct device name.
+
+```bash
 bash install-lab01.sh deploy \
-  --cluster itz-NEWCLUSTER \
-  --kubeconfig /home/automation/.kube/newlab.conf \
-  --scale-host 10.10.10.202 \
+  --cluster itz-REPLACE_ME \
+  --kubeconfig "$HOME/.kube/newlab.conf" \
+  --scale-host REPLACE_WITH_EXISTING_SCALE_IP \
   --ceph-disk /dev/vde \
   --claim-disks \
   --allow-worker-reboots
 ```
 
-The explicit flags `--claim-disks` and `--allow-worker-reboots` authorize potentially destructive disk provisioning and rolling Scale worker reboots, respectively. **Do not run this installer against a production or data-bearing system.** This release refuses non-TechZone API hostnames or mismatched node identities and requires OCP 4.21.x and `system:admin`.
+First deployment: provide Scale GUI credentials when prompted (password input is hidden); they are encrypted with Ansible Vault outside the working tree. No more manual installation steps should be necessary if the target environment matches the tested assumptions.
 
-### Optional preview, no cluster changes
+Look for **`PASS: ALL LAB 01 INSTALLATION AND STORAGE TEST STAGES.`** At the end, v2.3 also prints per-stage and total elapsed time. Logs reside under `work/<cluster>/logs/` and must not be shared without redaction.
 
-```bash
-bash install-lab01.sh plan \
-  --cluster itz-NEWCLUSTER \
-  --kubeconfig /home/automation/.kube/newlab.conf \
-  --scale-host 10.10.10.202 \
-  --ceph-disk /dev/vde
-```
+If it stops, see the [troubleshooting guide](docs/03-TROUBLESHOOTING.md). Resume a failed stage with `--from <stage>` only after diagnosing the problem; the runner does not silently disregard errors.
 
-`plan` reads the cluster and generates local files only. It does not test disk blankness or connect to the Scale management server. Those are checked at the appropriate live deployment stages.
-
-### First-run Scale GUI credential prompt (v2.1)
-
-Before making cluster changes, the first `deploy` for a given cluster shows:
-
-```text
-=== IBM Storage Scale GUI credentials (stored using Ansible Vault) ===
-Scale GUI username [csi-storage-gui-user]: 
-Scale GUI password (hidden):
-```
-
-Press **Enter** for the documented username. Type the password normally; it will not appear on screen. On later deploy/resume runs for the same cluster, the installer reuses the encrypted Vault values without asking again. `plan` never asks for credentials. Use `--update-scale-credentials` to replace stored credentials when your lab reservation changes.
-
-The random Vault key and the encrypted credentials are both saved with user-only permissions in separate directories under `~/.config/fusion-lab01/`, **not** in the installer or `work/` folder. Do not commit or share either. Keeping the key on the same host favors no-repeat prompts over defense against a compromised Ubuntu account.
-
-### Resume after a failure
-
-The single command is staged, and it prints the last failing stage and location of its log. After fixing the cause, rerun with the exact same options plus `--from STAGE`, where stage is one of:
-
-`fusion-ceph`, `ceph-io-test`, `scale-nodeprep`, `scale-operator`, `scale-client`, `scale-external`, or `final-verification`.
-
-For example, `--from scale-operator` resumes at operator activation, instead of reinstalling Ceph or relabeling workers. Only skip stages when you have verified that they completed successfully; the resume flag **does not assert previous-stage health**.
-
-## What the command actually does
-
-1. Pins the live TechZone API, user, OpenShift version and **exactly nine nodes** with 3 masters, 3 Ceph infrastructure workers and 3 application/Scale workers.
-2. Runs the original Fusion + Data Foundation/Ceph installation, auditing **exactly the selected `/dev/vde` on the three infra nodes** before any new disk claim.
-3. Tests Ceph CSI block-volume persistence by writing 16 MiB, remounting into a new pod, and comparing SHA-256 hashes.
-4. Creates the isolated Scale MachineConfigPool (MCP), applies the `kernel-devel` extension (selected workers may reboot), and activates the already-installed Scale Operator. Its activation stage retries a transient readiness failure.
-5. Deploys the three-node local, data-access Scale client on application workers only.
-6. Connects to the **pre-deployed external Scale server** (no new server installation), mounts existing `fs1`, and **discovers** its remote cluster ID via `mmremotecluster show all`.
-7. Creates `fusionfs1` with `clusterId` from live discovery and `volBackendFs` equal to the **local mounted filesystem resource** (`<generated-scale-name>-fs1`, NOT `fs1` or `fs1-<cluster-id>`).
-8. Tests dynamic Scale PVC provisioning and a 16 MiB write/remount/SHA-256 checksum, cleans up its own temporary namespace, and runs final Fusion/Ceph readiness verification.
-
-All stages are existing successful v1.2–v1.4.2 Ansible workflows **with target-specific assertions compiled for the new lab**. The Cluster and GUI secrets are not shared with an existing production installation. All changes occur against the explicit kubeconfig, not the ambient default context.
-
-## Important boundaries
-
-- The pre-deployed external Scale server must already exist, remain accessible from the cluster, and expose `fs1`. `--scale-host` supplies its management IP/hostname; **do not assume `10.10.10.202` is correct for every reservation**.
-- At the beginning of the **first deploy per cluster**, the installer prompts for Scale GUI username (Enter accepts `csi-storage-gui-user`) and a hidden password. Both are encrypted as Ansible Vault scalar variables outside the project at `~/.config/fusion-lab01/credentials/<cluster>.vault.yml`. A separate random, 0600 Vault key is stored under `~/.config/fusion-lab01/vault-keys/<cluster>.key`, also **outside the repository**. Subsequent runs reuse them without prompting. To change them, add `--update-scale-credentials` to a `deploy` or resume command. This convenience mode protects against accidental GitHub commits and casual disclosure; a user who can read both local files can decrypt the credentials. For stronger security, use an external secret manager or keep the Vault unlock key offline.
-- The backend `volBackendFs` issue is corrected in the source and preserved in generated workspaces. **Do not substitute the remote filesystem's plain name or append the remote cluster ID to it**.
-- Do not copy reference playbooks straight to a new cluster and run them: some contain historically pinned TechZone names. The `install-lab01.sh` entry point generates and checks their new target identities first.
-- CLI tools required on Ubuntu: `oc`, `ansible-playbook`, `ansible-vault`, `python3` with PyYAML, `jq`, `bash`, and the standard Linux tools the validated scripts invoke. Downloading the ZIP does not install tools.
-- This installer covers the **Fusion, Ceph, and external Scale installation/storage validation** portion of Lab 01. It does not automatically complete any other learning exercises, quizzes, or product service workflows in the official course.
-- Lab source contains no hardcoded Scale GUI password. Ansible Vault credentials and the local unlock key live in the operator's home directory outside the repository, and both must be excluded from any backup shared publicly. Lab source and generated workspaces can include operational details. Keep the Dropbox shared-folder permissions appropriate and do not publish raw logs containing HTTP headers or cookies.
-
-## Validation performed for v2.1
-
-Offline checks on the actual uploaded source: Python compilation, shell syntax, YAML parsing, and mock kubeconfig/`oc` discovery against a synthetic `itz-new987` nine-node cluster. The resulting compiled client and Scale manifests were inspected; the `fusionfs1` backend was verified as `<scale-name>-fs1` and the `clusterId` remained a runtime discovery variable.
-
-**Still outstanding:** one brand-new-cluster run of the *consolidated v2.1 command*. The success of v1.4.2 on `itz-s6fyum` does not by itself establish that every automated stage will work identically in another reservation.
+**Scope:** disposable nine-node IBM TechZone OpenShift 4.21.x; not a production installer, not a replacement for the external Scale server, and not the full official course exercise sequence.
