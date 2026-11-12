@@ -22,13 +22,30 @@ If a command is missing, return to the [prerequisites guide](HYPERV-UBUNTU-PRERE
 
 ## 2. Download the Lab 1 installer
 
-**Recommended for new users:** open the repository's [Releases page](https://github.com/ryanbeaty-ibm/ibm-fusion-techzone-automation/releases). Under the appropriate release, download the attached installer file, for example `IBM-Fusion-Lab01-OneCommand-v2.3.zip`.
+**Recommended for new users:** open the repository's [Releases page](https://github.com/ryanbeaty-ibm/ibm-fusion-techzone-automation/releases). Under the appropriate release, download the attached installer file, for example `IBM-Fusion-Lab01-OneCommand-v2.4.zip`.
 
 **Important:** a GitHub *release asset* (the maintainer-uploaded installer ZIP) is different from the automatic source archive under **Code → Download ZIP**. The latter downloads repository source and is **not necessarily** the tested one-command release package. If the expected ZIP is not listed under Releases, ask the repository maintainer to publish it before following the ZIP-based installer steps.
+
+**Version note:** The v2.4 installer is an **unvalidated pre-release** with offline tests passing; v2.3 remains the live-validated baseline.
 
 **Validation update (November 12, 2026):** the published v2.3 installer passed a fresh-cluster OCP 4.21.24 end-to-end installation and storage validation **after correcting the Scale GUI password and resuming the failed stage**. It did not succeed as an uninterrupted first attempt. See [v2.3 live validation](07-LIVE-VALIDATION-2026-11-12.md); the earlier [v2.2 record](../VALIDATED-LAB01-RESULT.md) is retained.
 
 ## 3. Make a fresh TechZone reservation
+
+<!-- LAB01 RESERVATION SETTINGS BEGIN -->
+When creating your reservation, choose **IBM Fusion on OpenShift Virtualization**. In the request wizard, open **Step 5 — Configuration** and use these values:
+
+| Configuration setting | Selection |
+| --- | --- |
+| OpenShift Cluster Version | **4.21** |
+| Worker Node Count | **3** |
+| Worker Node Flavor | **16 vCPU / 64 GB RAM / 300 GB ephemeral storage** |
+| VM Network CIDR | `10.10.10.0/24` (default) |
+| OCP/Kubernetes Cluster Network | `10.128.0.0/14` (default) |
+| OCP/Kubernetes Service Network | `172.30.0.0/16` (default) |
+
+The reservation provides the remaining control-plane and infrastructure nodes for the nine-node Lab 1 topology. Keep the displayed network defaults for the documented configuration. These settings describe the tested lab topology, not production sizing requirements.
+<!-- LAB01 RESERVATION SETTINGS END -->
 
 Reserve the environment required by the Lab 1 workbook (the project currently targets OCP 4.21.x). Record:
 
@@ -64,7 +81,7 @@ Follow the instructions in [README-START-HERE.md](LAB01-INSTALLATION-AND-CONFIGU
 
 ## 6. Deploy only after reviewing the plan
 
-Run the installer `deploy` only when you have positively identified the **intentionally disposable Ceph disks** and are authorized to make changes to your disposable TechZone reservation. Deploy can erase those disks and may reboot cluster nodes. Expect roughly **40 minutes** in a healthy lab. The deploy command prompts for the **Scale GUI username** (press Enter to accept `csi-storage-gui-user`) and the **hidden Scale GUI password** (enter it from the lab guide). Follow the post-install validation steps in [README-START-HERE.md](LAB01-INSTALLATION-AND-CONFIGURATION.md), and see the [Scale troubleshooting/resume guide](LAB01-SCALE-TROUBLESHOOTING.md) if authentication fails. Review the [November 12 v2.3 validation record](07-LIVE-VALIDATION-2026-11-12.md).
+Run the installer `deploy` only when you have positively identified the **intentionally disposable Ceph disks** and are authorized to make changes to your disposable TechZone reservation. Deploy can erase those disks and may reboot cluster nodes. Expect roughly **40 minutes** in a healthy lab. The deploy command prompts for the **Scale GUI username** (press Enter to accept `csi-storage-gui-user`) and the **hidden Scale GUI password twice** (confirmation required). New or updated credentials receive an early read-only API test from an OpenShift worker. Follow the post-install validation steps in [README-START-HERE.md](LAB01-INSTALLATION-AND-CONFIGURATION.md), and see the [Scale troubleshooting/resume guide](LAB01-SCALE-TROUBLESHOOTING.md) if authentication fails. Review the [November 12 v2.3 validation record](07-LIVE-VALIDATION-2026-11-12.md).
 
 ## Experienced Ansible user?
 

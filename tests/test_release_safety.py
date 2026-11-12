@@ -1,4 +1,4 @@
-"""Static checks for v2.3 safety fixes; does not connect to OpenShift."""
+"""Static checks for v2.4 safety fixes; does not connect to OpenShift."""
 from pathlib import Path
 import yaml
 
@@ -25,7 +25,7 @@ for required in ('work/', '*.vault.yml', '*.vault.yaml', '*.vault-password', '*.
 assert not any('\\n' in line for line in ignore)
 
 code = (root / 'installer/techzone_lab01.py').read_text()
-assert "RELEASE = '2.3.0'" in code
+assert "RELEASE = '2.4.0'" in code
 assert 'DEPLOYMENT ELAPSED:' in code
 assert 'stage_elapsed = time.monotonic() - stage_started' in code
 

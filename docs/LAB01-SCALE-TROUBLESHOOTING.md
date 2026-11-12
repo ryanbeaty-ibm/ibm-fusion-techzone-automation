@@ -99,3 +99,9 @@ Note: an intermediate Ansible summary on November 12 reported `Ready=True`, `Ava
 - Early REST API authentication and required-permission check from a network location **inside TechZone/OCP** (the Ubuntu VM may not directly reach the private Scale address), before any lengthy or destructive deployment.
 - Fail fast and report `401`/`403` with clear troubleshooting guidance instead of waiting up to 30 minutes without useful diagnostics.
 - Review whether later-stage `--from` recovery truly needs earlier-stage disk/reboot approval flags.
+
+## v2.4 early authentication preflight
+
+For new credentials or when running `deploy --update-scale-credentials`, v2.4 asks for the Scale GUI password twice and uses a temporary non-TTY debug pod on an OpenShift worker to make a read-only authenticated `GET /scalemgmt/v2/info` request. A 401 or 403 immediately stops deployment **before storage stages**; check the username, password and GUI account permissions. The Ubuntu automation VM cannot normally connect directly to the private Scale IP. If the node debug pod cannot be created, the preflight fails closed; check permissions and network routing. The early GET does not prove permission for all later remote-registration operations.
+
+Previously saved credentials are reused without a new prompt unless you provide `--update-scale-credentials`. Resume commands still require `--claim-disks` and `--allow-worker-reboots` in v2.4.

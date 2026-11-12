@@ -6,6 +6,8 @@ This is the **complete, step-by-step Quick Start** for the supported IBM Fusion 
 
 **What this does:** The `plan` command **checks lab readiness without changing cluster resources**; the `deploy` command **runs the Ansible automation** to install and verify the supported IBM Fusion, Fusion Data Foundation/Ceph, and external IBM Storage Scale portions of Lab 1. 
 
+**Before downloading the installer:** Reserve **IBM Fusion on OpenShift Virtualization** using the [Lab 1 TechZone configuration settings](GETTING-STARTED-FROM-ZERO.md#3-make-a-fresh-techzone-reservation) (OCP 4.21, three worker nodes, and the selected 16 vCPU/64 GB/300 GB worker flavor).
+
 **Starting without an Ansible server?** Follow [Getting Started from Zero](GETTING-STARTED-FROM-ZERO.md) first. The instructions below assume an Ubuntu automation host with Python, Ansible, OpenShift CLI (`oc`), SSH, and a current TechZone reservation. These instructions are for a **disposable lab, not production**.
 
 ## What Lab 1 automates
@@ -23,22 +25,24 @@ The workflow configures IBM Fusion Data Foundation, a three-node local Ceph stor
 
 ### Step 1 — Download and install the Ansible scripts on Ubuntu
 
-1. On your Windows PC, open [GitHub Releases](https://github.com/ryanbeaty-ibm/ibm-fusion-techzone-automation/releases). Open **IBM Fusion Lab 1 — Ansible Installer v2.3**.
-2. Under **Assets**, download **`IBM-Fusion-Lab01-OneCommand-v2.3.zip`** to `C:\Users\YOUR_USERNAME\Downloads`. **Do not use** GitHub's automatically generated **Source code (zip)**; it is not the packaged installer asset.
+1. On your Windows PC, open [GitHub Releases](https://github.com/ryanbeaty-ibm/ibm-fusion-techzone-automation/releases). Open **IBM Fusion Lab 1 — Ansible Installer v2.4 (pre-release)**.
+2. Under **Assets**, download **`IBM-Fusion-Lab01-OneCommand-v2.4.zip`** to `C:\Users\YOUR_USERNAME\Downloads`. **Do not use** GitHub's automatically generated **Source code (zip)**; it is not the packaged installer asset.
 3. Open a **SecureCRT Secure File Transfer Protocol (SFTP)** session to the Ubuntu VM. For the documented Ubuntu `automation` account, enter:
 
    ```text
    lcd C:\Users\YOUR_USERNAME\Downloads
    cd /home/automation
-   put IBM-Fusion-Lab01-OneCommand-v2.3.zip
+   put IBM-Fusion-Lab01-OneCommand-v2.4.zip
    ```
+
+   **Note:** `/home/automation` is the home directory for the Ubuntu user `automation` in our prerequisites guide. If your Ansible server uses a different account, replace `automation` with its username (for example, `/home/john`).
 
 4. In your **Ubuntu SSH session**, extract and open the installer directory (run these in Ubuntu, not PowerShell):
 
    ```bash
-   mkdir -p "$HOME/fusion-lab-v2.3"
-   unzip -o "$HOME/IBM-Fusion-Lab01-OneCommand-v2.3.zip" -d "$HOME/fusion-lab-v2.3"
-   cd "$HOME/fusion-lab-v2.3"
+   mkdir -p "$HOME/fusion-lab01-v2.4"
+   unzip -o "$HOME/IBM-Fusion-Lab01-OneCommand-v2.4.zip" -d "$HOME/fusion-lab01-v2.4"
+   cd "$HOME/fusion-lab01-v2.4"
    ls -l install-lab01.sh
    ```
 
@@ -73,11 +77,9 @@ The workflow configures IBM Fusion Data Foundation, a three-node local Ceph stor
 
 ### Step 3 — Obtain the lab values you will enter
 
-1. In the TechZone reservation's **Outputs** section, record **Environment ID** (example `itz-REPLACE_ME`). This is `--cluster`.
-2. Click **VM Remote Console**. Find the existing **`xxx-scale-2` / `xxx-scale-02`** virtual machine, and note its **IP Address**. This is `--scale-host` (the lab guide commonly shows `10.10.10.202`). The Scale VM is already deployed; the installer does **not** create it.
+1. Open your IBM TechZone reservation, scroll down to **Environments**, and expand **IBM Fusion on OpenShift Virtualization**. Under **OUTPUTS**, locate **Environment ID** (example `itz-REPLACE_ME`). This is `--cluster`.
+2. Under **OUTPUTS**, click **VM Remote Console**. Find the existing **`xxx-scale-2` / `xxx-scale-02`** virtual machine, and note its **IP Address**. This is `--scale-host` (the lab guide commonly shows `10.10.10.202`). The Scale VM is already deployed; the installer does **not** create it.
 3. In the IBM Fusion Installation and Configuration lab guide, see labeled **pages 30 and 76** for the **IBM Storage Scale GUI / REST API username and password**. The installer normally suggests username `csi-storage-gui-user`. You will enter its matching password privately during deployment; **do not add it to a Git file**.
-4. Confirm which unused **disposable** disk is assigned for Ceph on **each of the three infrastructure nodes**. The examples use `/dev/vde`; replace it if your reservation differs. `deploy` can erase the selected disks.
-
    **Need to log into the existing Scale Linux VM for troubleshooting?** Select the VM in **VM Remote Console**, click **Console** and use **RDP** with username `itzuser` and the **Bastion Password** from the reservation **Outputs**. This is **not** the Scale GUI password and `kubeadmin` is for OpenShift. See [Scale connectivity and credential troubleshooting](LAB01-SCALE-TROUBLESHOOTING.md).
 
 ### Step 4 — Validate your lab (read-only preflight check)
@@ -92,7 +94,7 @@ bash install-lab01.sh plan \
   --ceph-disk /dev/vde
 ```
 
-`REPLACE_ME.conf` is the filename you uploaded (for example, `lab01.conf`). The plan checks OCP version and health, ClusterOperators, MachineConfigPools, the selected target, and stage order. **It does not install anything or modify cluster resources.** Disk eligibility is checked immediately before Ceph claims during deployment; remote Scale GUI connectivity is checked later in the Scale connection stage. Confirm the displayed target before proceeding.
+`REPLACE_ME.conf` is the filename you uploaded (for example, `lab01.conf`). The plan checks OCP version and health, ClusterOperators, MachineConfigPools, the selected target, and stage order. **It does not install anything or modify cluster resources.** Disk eligibility is checked immediately before Ceph claims during deployment; new or updated Scale GUI credentials are checked from an OpenShift worker early during `deploy` before the storage stages. Confirm the displayed target before proceeding.
 
 ### Step 5 — Deploy Lab 1 (execute the Ansible automation)
 
@@ -108,10 +110,17 @@ bash install-lab01.sh deploy \
   --allow-worker-reboots
 ```
 
-**Interactive Scale credentials (current v2.3 behavior):**
+**Interactive Scale credentials (new in v2.4):**
 
-1. When prompted `Scale GUI username [csi-storage-gui-user]:`, press **Enter** to accept the shown default (or enter the assigned account).
-2. When prompted `Scale GUI password (hidden):`, enter the matching password from the lab guide and press **Enter**. **Characters will not appear as you type**. The password is stored using Ansible Vault outside the repository. **v2.3 prompts only once**; double-entry confirmation and early authentication testing are planned installer improvements, not current features.
+1. At `Scale GUI username [csi-storage-gui-user]:`, press **Enter** to accept the default, or type your assigned GUI user.
+2. At `Scale GUI password (hidden):`, type the GUI password from the lab guide and press **Enter**.
+3. At `Confirm Scale GUI password (hidden):`, **type that password a second time** and press **Enter**. Neither entry appears as you type.
+4. If the entries do not match, re-enter both; the installer allows **three attempts** and stops without saving the new credentials if they still differ.
+5. After a match, the installer performs a **read-only, early Scale GUI authentication test from a temporary OpenShift worker debug pod**. This is necessary because the Ubuntu control node cannot normally reach the private Scale IP. **HTTP 200** is required before new credentials are encrypted and deployment begins. HTTP 401/403 stops immediately with a clear message. The temporary debug pod changes no persistent cluster storage, but requires permission to debug a node.
+
+If you are **reusing previously saved encrypted credentials**, the installer does not prompt or rerun this early check by default. Use `--update-scale-credentials` to re-enter, reconfirm, and test them. The early GET check confirms authentication to `/scalemgmt/v2/info`; remote registration permissions are verified later during the Scale connection stage.
+
+The credentials remain outside the Git repository in a user-only **Ansible Vault** file. Never paste passwords into GitHub, terminal commands, or published logs.
 
 ### Step 6 — Monitor and verify deployment
 
@@ -119,6 +128,6 @@ bash install-lab01.sh deploy \
 
 A successful run ends with `PASS: ALL LAB 01 INSTALLATION AND STORAGE TEST STAGES.` This covers the supported **installation and persistent-storage** portion of Lab 1, not every workbook exercise. The Scale test also proves volume provisioning, write, remount, checksum, and cleanup.
 
-**Recovery from a wrong Scale GUI password:** If only `scale-external` failed and the earlier stages passed, see [Scale troubleshooting and resume](LAB01-SCALE-TROUBLESHOOTING.md). Do **not** reinstall Fusion or Ceph. The v2.3 resume command requires both authorization flags **even when resuming a later stage**.
+**Recovery from a wrong Scale GUI password:** If only `scale-external` failed and the earlier stages passed, see [Scale troubleshooting and resume](LAB01-SCALE-TROUBLESHOOTING.md). Do **not** reinstall Fusion or Ceph. The v2.4 resume command still requires both authorization flags **even when resuming a later stage**.
 
-**Validation status:** v2.3 passed on a fresh OCP 4.21.24 TechZone cluster on **November 12, 2026**, **after correcting a mistyped Scale GUI password and resuming from `scale-external`**. This was a validated recovery, **not** an uninterrupted first-attempt deployment. See [the v2.3 validation record](07-LIVE-VALIDATION-2026-11-12.md) and [the original v2.2 validation record](../VALIDATED-LAB01-RESULT.md).
+**Validation status:** **v2.4 is an unvalidated pre-release candidate** (offline tests only, including password confirmation and a mocked early API test). The prior v2.3 passed on a fresh OCP 4.21.24 TechZone cluster on **November 12, 2026**, **after correcting a mistyped Scale GUI password and resuming from `scale-external`**. This was a validated recovery, **not** an uninterrupted first-attempt deployment. See [the v2.3 validation record](07-LIVE-VALIDATION-2026-11-12.md) and [the original v2.2 validation record](../VALIDATED-LAB01-RESULT.md).

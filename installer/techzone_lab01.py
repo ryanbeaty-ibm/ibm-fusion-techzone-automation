@@ -23,7 +23,7 @@ import textwrap
 
 HERE = pathlib.Path(__file__).resolve().parent.parent
 REFERENCE = HERE / 'reference'
-RELEASE = '2.3.0'
+RELEASE = '2.4.0'
 STAGES = (
     'fusion-ceph',
     'ceph-io-test',
@@ -244,7 +244,78 @@ def vault_encrypt_string(vault_key, name, value):
     return result.stdout.strip() + '\n'
 
 
-def configure_scale_vault(cluster, update=False):
+def prompt_scale_gui_credentials(max_attempts=3):
+    """Collect matching secret values without echoing or persisting failures."""
+    print('=== IBM Storage Scale GUI credentials (stored using Ansible Vault) ===', flush=True)
+    username = input('Scale GUI username [csi-storage-gui-user]: ').strip() or 'csi-storage-gui-user'
+    if not username or any(c in username for c in ('\n', '\r', '\0')):
+        stop('A nonempty, single-line Scale GUI username is required.')
+    for attempt in range(1, max_attempts + 1):
+        password = getpass.getpass('Scale GUI password (hidden): ')
+        confirm = getpass.getpass('Confirm Scale GUI password (hidden): ')
+        if not password or any(c in password for c in ('\n', '\r', '\0')):
+            stop('A nonempty, single-line Scale GUI password is required.')
+        if secrets.compare_digest(password, confirm):
+            print('PASS: Scale GUI passwords match.', flush=True)
+            return username, password
+        if attempt < max_attempts:
+            print(f'ERROR: Passwords do not match. Please re-enter both ({attempt}/{max_attempts}).', flush=True)
+    stop('Scale GUI password confirmation failed after three attempts. No credentials saved.')
+
+
+def _curl_config_quote(value):
+    """Escape double quotes and backslashes for curl's --config stdin format."""
+    if any(c in value for c in ('\n', '\r', '\0')):
+        stop('Unsupported control character in Scale GUI credentials.')
+    return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def verify_scale_gui_from_worker(params, username, password):
+    """Early, read-only Scale GUI authentication from within the OCP worker network.
+
+    oc debug creates a short-lived node debug pod. Curl configuration, including
+    Basic Auth credentials, is streamed through non-TTY stdin; no credential is
+    present in argv, pod definition, environment, log, or stored on disk.
+    Do not replace -T with interactive/TTY mode: a terminal can echo input.
+    """
+    node = f"{params['cluster']}-worker-1"
+    url = f"https://{params['scale_host']}:443/scalemgmt/v2/info"
+    # '--tty=false' (explicitly set) keeps oc debug stdin attached without
+    # allocating a TTY, even when a command follows '--'.
+    cmd = ['oc', f"--kubeconfig={params['kubeconfig']}", 'debug', '--tty=false',
+           f'node/{node}', '--', 'chroot', '/host', 'curl',
+           '--silent', '--show-error', '--insecure', '--connect-timeout', '6',
+           '--max-time', '20', '--output', '/dev/null',
+           '--write-out', 'FUSION_SCALE_HTTP=%{http_code}', '--config', '-']
+    curl_input = ('url = ' + _curl_config_quote(url) + '\n'
+                  + 'user = ' + _curl_config_quote(username + ':' + password) + '\n')
+    print(f'=== Early Scale GUI authentication test from OpenShift worker {node} ===', flush=True)
+    print('Temporary debug pod; read-only GET /scalemgmt/v2/info; credentials sent via non-TTY stdin.', flush=True)
+    try:
+        result = subprocess.run(cmd, input=curl_input, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, check=False, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        stop('Unable to complete Scale GUI authentication preflight from an OpenShift worker. '
+             'No deployment started. Check worker debug access and Scale network connectivity.')
+    code = re.findall(r'FUSION_SCALE_HTTP=(\d{3})', result.stdout)
+    status = code[-1] if code else None
+    if result.returncode == 0 and status == '200':
+        print('PASS: The remote Scale GUI accepted these credentials (HTTP 200).', flush=True)
+        return
+    # Do not echo raw oc stderr/stdout here: avoid accidental disclosure of
+    # injected data by a broken or replaced oc/debug binary.
+    if status in ('401', '403'):
+        stop(f'Scale GUI rejected login or API access (HTTP {status}). '
+             'Recheck the GUI username/password in the TechZone lab guide. '
+             'No deployment started; no credentials saved.')
+    if status == '000':
+        stop('Scale GUI could not be reached from the OpenShift worker (HTTP 000). '
+             'No deployment started; no credentials saved.')
+    stop('Scale GUI authentication preflight could not be completed from OpenShift. '
+         'No deployment started; no credentials saved. Check worker debug access and network routing.')
+
+
+def configure_scale_vault(cluster, update=False, params=None):
     vault_file, key_file = scale_vault_paths(cluster)
     private_dir(vault_file.parent.parent)
     private_dir(vault_file.parent)
@@ -261,11 +332,13 @@ def configure_scale_vault(cluster, update=False):
         stop('ansible-vault is required to encrypt and reuse Scale GUI credentials.')
     if not sys.stdin.isatty():
         stop('Initial credential setup requires an interactive terminal (no --password on the command line).')
-    print('=== IBM Storage Scale GUI credentials (stored using Ansible Vault) ===', flush=True)
-    username = input('Scale GUI username [csi-storage-gui-user]: ').strip() or 'csi-storage-gui-user'
-    password = getpass.getpass('Scale GUI password (hidden): ')
-    if not username or not password or any(c in username + password for c in ('\n','\r','\0')):
-        stop('A nonempty, single-line username/password is required.')
+    username, password = prompt_scale_gui_credentials()
+    if params is not None:
+        verify_scale_gui_from_worker(params, username, password)
+    else:
+        # Offline tests may call this helper without a cluster; the live main
+        # always supplies params for new/updated credentials.
+        print('NOTE: No live Scale API verification requested by caller.', flush=True)
     if not key_file.exists():
         # Convenience mode: the random key is local-only and saved OUTSIDE the repo.
         fd = os.open(key_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -434,7 +507,7 @@ def main():
         return
     vault = None
     if STAGES.index(args.start_stage) <= STAGES.index('scale-external'):
-        vault = configure_scale_vault(args.cluster, update=args.update_scale_credentials)
+        vault = configure_scale_vault(args.cluster, update=args.update_scale_credentials, params=params)
     elif args.update_scale_credentials:
         stop('Cannot update Scale credentials when resuming after the scale-external stage.')
     execute(params, folder, args.start_stage, vault=vault)

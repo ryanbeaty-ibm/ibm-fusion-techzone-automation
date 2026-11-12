@@ -105,7 +105,7 @@ Once the workstation is ready, transfer the **actual release ZIP filename** from
 ```text
 lcd C:\Users\YOUR_USERNAME\Downloads
 cd /home/automation
-put IBM-Fusion-Lab01-OneCommand-v2.3.zip
+put IBM-Fusion-Lab01-OneCommand-v2.4.zip
 ```
 
 Run the version-specific extraction and installation steps from this repository's Lab01 instructions. The ZIP filename above is a versioned **example**, not a promise that the latest release has that name.

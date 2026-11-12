@@ -21,6 +21,23 @@ This repository provides repeatable deployment and verification for the **IBM Fu
 
 > **Lab environment only:** Designed for a disposable nine-node Red Hat OpenShift Container Platform (OCP) 4.21.x TechZone reservation. Not intended for production environments.
 
+## TechZone reservation — Lab 1
+
+> **Before starting Lab 1:** In **IBM Technology Zone (TechZone)**, reserve **IBM Fusion on OpenShift Virtualization**. In the reservation wizard, select **Step 5 — Configuration** and use the settings below for the documented Lab 1 environment.
+
+| Configuration setting | Selection |
+| --- | --- |
+| OpenShift Cluster Version | **4.21** |
+| Worker Node Count | **3** |
+| Worker Node Flavor | **16 vCPU / 64 GB RAM / 300 GB ephemeral storage** |
+| VM Network CIDR | `10.10.10.0/24` (default) |
+| OCP/Kubernetes Cluster Network | `10.128.0.0/14` (default) |
+| OCP/Kubernetes Service Network | `172.30.0.0/16` (default) |
+
+The template supplies the other nodes needed for this **nine-node** lab (three control-plane nodes and three infrastructure nodes). Leave the three network settings at their displayed defaults unless your reservation requires a different network layout. This is a **disposable training environment**, not a production deployment.
+
+[Full Lab 1 installation instructions](docs/LAB01-INSTALLATION-AND-CONFIGURATION.md) · [New to Ansible? Setup guide](docs/GETTING-STARTED-FROM-ZERO.md)
+
 ## Level 4 lab roadmap
 
 | Lab | IBM Fusion Level 4 exercise | Automation |

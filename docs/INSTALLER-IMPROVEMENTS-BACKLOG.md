@@ -22,3 +22,9 @@ These items are **proposed changes for the next installer code release**, not fe
 - Include release version, stage names, and log paths in a concise final summary.
 - Re-run an entire fresh-cluster deployment after installer changes, with an intentionally bad GUI password as a negative test and a good password as a positive test.
 - Keep the original v2.3 validated package and release immutable; publish changed installer code as a **new version**, with a new release asset and honest validation status.
+
+## v2.4 candidate implementation (November 12, 2026)
+
+- **Implemented, offline-tested:** Double hidden password confirmation and mismatch retries (maximum three); no Vault write until credentials match.
+- **Implemented, offline-tested only:** Early read-only Scale `/scalemgmt/v2/info` authentication from a short-lived non-TTY OpenShift worker debug pod, with credentials streamed over stdin. Needs live TechZone validation.
+- **Still pending:** Early validation of all later registration permissions, elimination of unnecessary stage-resume safety flags, improved stage-level 401/403 diagnostics, and new fresh-environment acceptance testing.
