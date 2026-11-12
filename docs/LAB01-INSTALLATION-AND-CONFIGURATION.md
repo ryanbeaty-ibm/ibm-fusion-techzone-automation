@@ -8,6 +8,19 @@ This is the **complete, step-by-step Quick Start** for the supported IBM Fusion 
 
 **Starting without an Ansible server?** Follow [Getting Started from Zero](GETTING-STARTED-FROM-ZERO.md) first. The instructions below assume an Ubuntu automation host with Python, Ansible, OpenShift CLI (`oc`), SSH, and a current TechZone reservation. These instructions are for a **disposable lab, not production**.
 
+## What Lab 1 automates
+
+```mermaid
+flowchart TD
+    A[Verify OpenShift cluster] --> B[Install IBM Fusion and Ceph storage]
+    B --> C[Test Ceph persistent storage]
+    C --> D[Prepare Scale workers and deploy client]
+    D --> E[Connect to existing external Scale filesystem]
+    E --> F[Test Scale persistence and verify installation]
+```
+
+The workflow configures IBM Fusion Data Foundation, a three-node local Ceph storage cluster, and a three-node IBM Storage Scale data-access client. It connects to the predeployed Scale filesystem and creates the `fusionfs1` StorageClass. Both backends are tested for persistent data across pod replacement using SHA-256 verification.
+
 ### Step 1 — Download and install the Ansible scripts on Ubuntu
 
 1. On your Windows PC, open [GitHub Releases](https://github.com/ryanbeaty-ibm/ibm-fusion-techzone-automation/releases). Open **IBM Fusion Lab 1 — Ansible Installer v2.3**.

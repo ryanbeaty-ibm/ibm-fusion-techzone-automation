@@ -46,19 +46,6 @@ Each IBM Fusion Level 4 lab has its **own instructions page**. Select a lab from
 
 Labs 2–5 are planned; their own guide links will be added as those labs become available.
 
-## What Lab 1 automates
-
-```mermaid
-flowchart TD
-    A[Verify OpenShift cluster] --> B[Install IBM Fusion and Ceph storage]
-    B --> C[Test Ceph persistent storage]
-    C --> D[Prepare Scale workers and deploy client]
-    D --> E[Connect to existing external Scale filesystem]
-    E --> F[Test Scale persistence and verify installation]
-```
-
-The workflow configures IBM Fusion Data Foundation, a three-node local Ceph storage cluster, and a three-node IBM Storage Scale data-access client. It connects to the predeployed Scale filesystem and creates the `fusionfs1` StorageClass. Both backends are tested for persistent data across pod replacement using SHA-256 verification.
-
 ## Documentation
 
 [Start here](README-START-HERE.md) · [Prerequisites](docs/00-PREREQUISITES.md) · [Deployment runbook](docs/01-FRESH-LAB-RUNBOOK.md) · [Validation](docs/02-VALIDATION.md) · [Troubleshooting](docs/03-TROUBLESHOOTING.md) · [Live test results](docs/06-LIVE-VALIDATION-2026-11-11.md) · [Changelog](CHANGELOG.md) · [Security](SECURITY.md)
