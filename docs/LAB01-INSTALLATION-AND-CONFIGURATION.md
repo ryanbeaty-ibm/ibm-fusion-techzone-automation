@@ -6,7 +6,7 @@ This is the **complete, step-by-step Quick Start** for the supported IBM Fusion 
 
 **What this does:** The `plan` command **checks lab readiness without changing cluster resources**; the `deploy` command **runs the Ansible automation** to install and verify the supported IBM Fusion, Fusion Data Foundation/Ceph, and external IBM Storage Scale portions of Lab 1. 
 
-**Before downloading the installer:** Reserve **IBM Fusion on OpenShift Virtualization** using the [Lab 1 TechZone configuration settings](GETTING-STARTED-FROM-ZERO.md#3-make-a-fresh-techzone-reservation) (OCP 4.21, three worker nodes, and the selected 16 vCPU/64 GB/300 GB worker flavor).
+**Before downloading the installer:** Reserve **IBM Fusion on OpenShift Virtualization** using the [IBM Fusion Level 4 TechZone configuration settings](GETTING-STARTED-FROM-ZERO.md#3-make-a-fresh-techzone-reservation) (OCP 4.21, three worker nodes, and the selected 16 vCPU/64 GB/300 GB worker flavor).
 
 **Starting without an Ansible server?** Follow [Getting Started from Zero](GETTING-STARTED-FROM-ZERO.md) first. The instructions below assume an Ubuntu automation host with Python, Ansible, OpenShift CLI (`oc`), SSH, and a current TechZone reservation. These instructions are for a **disposable lab, not production**.
 

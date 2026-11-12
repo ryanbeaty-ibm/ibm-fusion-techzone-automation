@@ -21,9 +21,9 @@ This repository provides repeatable deployment and verification for the **IBM Fu
 
 > **Lab environment only:** Designed for a disposable nine-node Red Hat OpenShift Container Platform (OCP) 4.21.x TechZone reservation. Not intended for production environments.
 
-## TechZone reservation — Lab 1
+## Recommended TechZone reservation — IBM Fusion Level 4
 
-> **Before starting Lab 1:** In **IBM Technology Zone (TechZone)**, reserve **IBM Fusion on OpenShift Virtualization**. In the reservation wizard, select **Step 5 — Configuration** and use the settings below for the documented Lab 1 environment.
+> **Recommended for IBM Fusion Level 4 labs:** In **IBM Technology Zone (TechZone)**, reserve **IBM Fusion on OpenShift Virtualization**. In the reservation wizard, select **Step 5 — Configuration** and use the settings below. Our earlier **8-vCPU / 32-GB workers** left insufficient CPU and memory headroom for Fusion and storage workloads; the **16-vCPU / 64-GB worker** configuration provides more room for the Level 4 exercises.
 
 | Configuration setting | Selection |
 | --- | --- |
@@ -34,7 +34,7 @@ This repository provides repeatable deployment and verification for the **IBM Fu
 | OCP/Kubernetes Cluster Network | `10.128.0.0/14` (default) |
 | OCP/Kubernetes Service Network | `172.30.0.0/16` (default) |
 
-The template supplies the other nodes needed for this **nine-node** lab (three control-plane nodes and three infrastructure nodes). Leave the three network settings at their displayed defaults unless your reservation requires a different network layout. This is a **disposable training environment**, not a production deployment.
+The template supplies three control-plane and three infrastructure nodes in addition to the three configured workers (**nine nodes total**). Leave the three network settings at their displayed defaults unless the lab requires otherwise. This is a **recommended training baseline**, not production sizing; later exercises may need additional resources. The 300-GB ephemeral disk is **not a substitute for the separate disposable Ceph disk** used in Lab 1.
 
 [Full Lab 1 installation instructions](docs/LAB01-INSTALLATION-AND-CONFIGURATION.md) · [New to Ansible? Setup guide](docs/GETTING-STARTED-FROM-ZERO.md)
 

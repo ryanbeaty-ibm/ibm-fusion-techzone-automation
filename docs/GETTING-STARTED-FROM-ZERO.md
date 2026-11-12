@@ -33,7 +33,7 @@ If a command is missing, return to the [prerequisites guide](HYPERV-UBUNTU-PRERE
 ## 3. Make a fresh TechZone reservation
 
 <!-- LAB01 RESERVATION SETTINGS BEGIN -->
-When creating your reservation, choose **IBM Fusion on OpenShift Virtualization**. In the request wizard, open **Step 5 — Configuration** and use these values:
+For **IBM Fusion Level 4 training** (not just Lab 1), choose **IBM Fusion on OpenShift Virtualization**. In the request wizard, open **Step 5 — Configuration** and use these values. Earlier trials with 8-vCPU/32-GB workers left insufficient CPU and memory headroom for Fusion and storage workloads:
 
 | Configuration setting | Selection |
 | --- | --- |
@@ -44,7 +44,7 @@ When creating your reservation, choose **IBM Fusion on OpenShift Virtualization*
 | OCP/Kubernetes Cluster Network | `10.128.0.0/14` (default) |
 | OCP/Kubernetes Service Network | `172.30.0.0/16` (default) |
 
-The reservation provides the remaining control-plane and infrastructure nodes for the nine-node Lab 1 topology. Keep the displayed network defaults for the documented configuration. These settings describe the tested lab topology, not production sizing requirements.
+The reservation provides the three control-plane and three infrastructure nodes for the nine-node Level 4 training topology. Keep the displayed network defaults. This is a recommended training baseline, not production sizing, and other exercises may need more capacity. The 300-GB ephemeral disk does not replace the separate disposable Ceph disk required by Lab 1.
 <!-- LAB01 RESERVATION SETTINGS END -->
 
 Reserve the environment required by the Lab 1 workbook (the project currently targets OCP 4.21.x). Record:
