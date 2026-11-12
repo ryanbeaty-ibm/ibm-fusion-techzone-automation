@@ -13,7 +13,7 @@ On your Windows computer, download the kubeconfig from your current IBM TechZone
 The following paths are examples from the tested Windows/Ubuntu setup. Adapt them to your machines.
 
 ```text
-lcd D:\Dropbox\Fusion
+lcd C:\Users\YOUR_USERNAME\Downloads
 cd /home/automation/.kube
 put newlab.conf
 ```
@@ -39,7 +39,7 @@ The installer will perform its own node, OpenShift and ClusterOperator checks. Y
 Place `IBM-Fusion-Lab01-OneCommand-v2.3.zip` in your Windows working folder and use SecureCRT SFTP:
 
 ```text
-lcd D:\Dropbox\Fusion
+lcd C:\Users\YOUR_USERNAME\Downloads
 cd /home/automation
 put IBM-Fusion-Lab01-OneCommand-v2.3.zip
 ```
@@ -87,3 +87,7 @@ Look for **`PASS: ALL LAB 01 INSTALLATION AND STORAGE TEST STAGES.`** At the end
 If it stops, see the [troubleshooting guide](docs/03-TROUBLESHOOTING.md). Resume a failed stage with `--from <stage>` only after diagnosing the problem; the runner does not silently disregard errors.
 
 **Scope:** disposable nine-node IBM TechZone OpenShift 4.21.x; not a production installer, not a replacement for the external Scale server, and not the full official course exercise sequence.
+
+## Hyper-V / Ubuntu automation VM prerequisites
+
+For Windows Hyper-V setup and Ubuntu automation dependencies, see [Hyper-V + Ubuntu prerequisites](docs/HYPERV-UBUNTU-PREREQUISITES.md).

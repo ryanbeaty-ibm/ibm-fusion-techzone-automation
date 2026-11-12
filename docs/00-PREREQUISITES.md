@@ -19,10 +19,10 @@ Record the reservation's **cluster prefix, OpenShift API endpoint, kubeconfig do
 
 ## 2. Transfer the kubeconfig to Ubuntu
 
-Example when using SecureCRT SFTP on a Windows PC with the working Dropbox folder `D:\Dropbox\Fusion`:
+Example when using SecureCRT SFTP on a Windows PC with the working Dropbox folder `C:\Users\YOUR_USERNAME\Downloads`:
 
 ```text
-lcd D:\Dropbox\Fusion
+lcd C:\Users\YOUR_USERNAME\Downloads
 cd /home/automation/.kube
 put lab01.conf
 ```
@@ -49,10 +49,10 @@ Expected: `system:admin`, the **new** reservation API, nine Ready nodes, and Ope
 
 ## 3. Transfer and extract the installer
 
-Put `IBM-Fusion-Lab01-OneCommand-v2.3.zip` in `D:\Dropbox\Fusion`, then SecureCRT SFTP:
+Put `IBM-Fusion-Lab01-OneCommand-v2.3.zip` in `C:\Users\YOUR_USERNAME\Downloads`, then SecureCRT SFTP:
 
 ```text
-lcd D:\Dropbox\Fusion
+lcd C:\Users\YOUR_USERNAME\Downloads
 cd /home/automation
 put IBM-Fusion-Lab01-OneCommand-v2.3.zip
 ```
@@ -86,3 +86,7 @@ preflight. It verifies the OpenShift ClusterVersion, every ClusterOperator, and
 all MachineConfigPools. If any is unhealthy, **the installer stops before
 applying any resources**. The existing Ceph disk qualification occurs immediately
 before disk claims; the external Scale connection stage validates that server.
+
+## Hyper-V / Ubuntu automation VM prerequisites
+
+For Windows Hyper-V setup and Ubuntu automation dependencies, see [Hyper-V + Ubuntu prerequisites](HYPERV-UBUNTU-PREREQUISITES.md).
