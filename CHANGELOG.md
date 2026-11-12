@@ -1,5 +1,14 @@
 # Changelog
 
+<!-- BEGIN DOCS V3.3 LAYOUT -->
+## 2026-11-12 - Repository navigation cleanup (documentation only)
+
+- Moved Lab 1 Quick Start instructions from the project home page to `docs/LAB01-INSTALLATION-AND-CONFIGURATION.md`.
+- Linked the Lab 1 roadmap entry to that dedicated guide and retained the old Start Here URL as a pointer.
+- Updated introductory prerequisite links. No changes to the v2.3 installer or release ZIP.
+<!-- END DOCS V3.3 LAYOUT -->
+
+
 <!-- BEGIN DOCS V3.2 CHANGELOG -->
 ## 2026-11-12 â€” Documentation and v2.3 validation (no installer code change)
 

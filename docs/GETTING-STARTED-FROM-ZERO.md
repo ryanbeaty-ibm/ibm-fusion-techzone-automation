@@ -56,16 +56,16 @@ oc --kubeconfig="$HOME/.kube/lab01.conf" whoami
 oc --kubeconfig="$HOME/.kube/lab01.conf" get nodes
 ```
 
-For the tested SecureCRT file-transfer procedure and exact steps, continue in [Start here — Lab 1 installer](../README-START-HERE.md). That file assumes this Ubuntu setup is now finished.
+For the tested SecureCRT file-transfer procedure and exact steps, continue in [Start here — Lab 1 installer](LAB01-INSTALLATION-AND-CONFIGURATION.md). That guide assumes this Ubuntu setup is now finished.
 
 ## 5. Transfer the installer ZIP and run the read-only plan
 
-Follow the instructions in [README-START-HERE.md](../README-START-HERE.md) to transfer and unpack the **downloaded release ZIP** into a new versioned directory on Ubuntu (do not overwrite an earlier validated workspace). Run the read-only `plan` first, examine the selected cluster, external Storage Scale endpoint, and storage devices, and confirm the environment is healthy. The `plan` does **not** change cluster resources; it also does not yet validate the external Scale GUI password.
+Follow the instructions in [README-START-HERE.md](LAB01-INSTALLATION-AND-CONFIGURATION.md) to transfer and unpack the **downloaded release ZIP** into a new versioned directory on Ubuntu (do not overwrite an earlier validated workspace). Run the read-only `plan` first, examine the selected cluster, external Storage Scale endpoint, and storage devices, and confirm the environment is healthy. The `plan` does **not** change cluster resources; it also does not yet validate the external Scale GUI password.
 
 ## 6. Deploy only after reviewing the plan
 
-Run the installer `deploy` only when you have positively identified the **intentionally disposable Ceph disks** and are authorized to make changes to your disposable TechZone reservation. Deploy can erase those disks and may reboot cluster nodes. Expect roughly **40 minutes** in a healthy lab. The deploy command prompts for the **Scale GUI username** (press Enter to accept `csi-storage-gui-user`) and the **hidden Scale GUI password** (enter it from the lab guide). Follow the post-install validation steps in [README-START-HERE.md](../README-START-HERE.md), and see the [Scale troubleshooting/resume guide](LAB01-SCALE-TROUBLESHOOTING.md) if authentication fails. Review the [November 12 v2.3 validation record](07-LIVE-VALIDATION-2026-11-12.md).
+Run the installer `deploy` only when you have positively identified the **intentionally disposable Ceph disks** and are authorized to make changes to your disposable TechZone reservation. Deploy can erase those disks and may reboot cluster nodes. Expect roughly **40 minutes** in a healthy lab. The deploy command prompts for the **Scale GUI username** (press Enter to accept `csi-storage-gui-user`) and the **hidden Scale GUI password** (enter it from the lab guide). Follow the post-install validation steps in [README-START-HERE.md](LAB01-INSTALLATION-AND-CONFIGURATION.md), and see the [Scale troubleshooting/resume guide](LAB01-SCALE-TROUBLESHOOTING.md) if authentication fails. Review the [November 12 v2.3 validation record](07-LIVE-VALIDATION-2026-11-12.md).
 
 ## Experienced Ansible user?
 
-You can skip Ubuntu/Hyper-V setup if you already have a compatible Ansible control node with Python, `oc`, SSH access, and a fresh kubeconfig. Go directly to [Start here — Lab 1 installer](../README-START-HERE.md).
+You can skip Ubuntu/Hyper-V setup if you already have a compatible Ansible control node with Python, `oc`, SSH access, and a fresh kubeconfig. Go directly to [Start here — Lab 1 installer](LAB01-INSTALLATION-AND-CONFIGURATION.md).

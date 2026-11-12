@@ -1,7 +1,7 @@
 # 00 — Prerequisites, SFTP and kubeconfig
 
 <!-- BEGIN DOCS V3.2 POINTER -->
-**First installation?** The [Lab 1 Start Here guide](../README-START-HERE.md) now includes the packaged installer transfer, kubeconfig download/SFTP, TechZone Environment ID and external Scale IP discovery, plan and deploy commands, hidden GUI password prompt, and recovery procedure. The [Scale troubleshooting guide](LAB01-SCALE-TROUBLESHOOTING.md) distinguishes the VM `itzuser`/Bastion Password from Scale GUI API credentials.
+**First installation?** The [Lab 1 Installation and Configuration guide](LAB01-INSTALLATION-AND-CONFIGURATION.md) now includes the packaged installer transfer, kubeconfig download/SFTP, TechZone Environment ID and external Scale IP discovery, plan and deploy commands, hidden GUI password prompt, and recovery procedure. The [Scale troubleshooting guide](LAB01-SCALE-TROUBLESHOOTING.md) distinguishes the VM `itzuser`/Bastion Password from Scale GUI API credentials.
 <!-- END DOCS V3.2 POINTER -->
 
 
