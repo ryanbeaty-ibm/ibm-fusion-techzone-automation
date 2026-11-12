@@ -82,7 +82,7 @@ chmod 700 "$HOME/.kube"
 ```text
 lcd C:\Users\YOUR_USERNAME\Downloads
 cd /home/automation/.kube
-put newlab.conf
+put lab01.conf
 ```
 
 `YOUR_USERNAME` and `/home/automation` are examples; adjust them to your actual local and Linux user directories.
@@ -90,8 +90,8 @@ put newlab.conf
 After transfer, run in Ubuntu:
 
 ```bash
-chmod 600 "$HOME/.kube/newlab.conf"
-export KUBECONFIG="$HOME/.kube/newlab.conf"
+chmod 600 "$HOME/.kube/lab01.conf"
+export KUBECONFIG="$HOME/.kube/lab01.conf"
 oc whoami
 oc get nodes
 ```

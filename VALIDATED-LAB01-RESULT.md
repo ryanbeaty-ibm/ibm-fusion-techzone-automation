@@ -1,5 +1,10 @@
 # Field validation summary
 
+<!-- BEGIN DOCS V3.2 HISTORY -->
+> **Newer validation record:** The v2.3 package also passed a fresh TechZone end-to-end storage validation **after stage-level credential recovery** on November 12, 2026. See [v2.3 live validation](docs/07-LIVE-VALIDATION-2026-11-12.md). This earlier record is preserved for historical accuracy.
+<!-- END DOCS V3.2 HISTORY -->
+
+
 | Release | Reservation | Date | Outcome |
 |---|---|---|---|
 | **v2.2** | Fresh nine-node TechZone OCP 4.21.24 cluster | November 11, 2026 | **PASS — all seven stages** |

@@ -26,7 +26,7 @@ If a command is missing, return to the [prerequisites guide](HYPERV-UBUNTU-PRERE
 
 **Important:** a GitHub *release asset* (the maintainer-uploaded installer ZIP) is different from the automatic source archive under **Code → Download ZIP**. The latter downloads repository source and is **not necessarily** the tested one-command release package. If the expected ZIP is not listed under Releases, ask the repository maintainer to publish it before following the ZIP-based installer steps.
 
-**Current validation note:** the v2.3 package is described in this repository as a cleanup candidate; v2.2 is the preceding fresh-cluster, end-to-end validated release. Check the release description and [validation record](../VALIDATED-LAB01-RESULT.md) for the package you choose.
+**Validation update (November 12, 2026):** the published v2.3 installer passed a fresh-cluster OCP 4.21.24 end-to-end installation and storage validation **after correcting the Scale GUI password and resuming the failed stage**. It did not succeed as an uninterrupted first attempt. See [v2.3 live validation](07-LIVE-VALIDATION-2026-11-12.md); the earlier [v2.2 record](../VALIDATED-LAB01-RESULT.md) is retained.
 
 ## 3. Make a fresh TechZone reservation
 
@@ -36,7 +36,7 @@ Reserve the environment required by the Lab 1 workbook (the project currently ta
 - The existing external IBM Storage Scale server's address and required credentials.
 - The **disposable** disk device assigned for Ceph storage on **each** of the three infrastructure nodes.
 
-Use a newly downloaded kubeconfig for the current reservation. Never commit kubeconfig files, passwords, tokens, private keys, or other lab credentials to Git.
+Find the **Environment ID** in reservation Outputs, the existing `xxx-scale-2` VM **IP address** under VM Remote Console, and the **Scale GUI username/password** in the IBM Fusion lab guide (labeled pages **30 and 76**). The GUI credentials are different from the VM login credentials. Use a newly downloaded kubeconfig for the current reservation. Never commit kubeconfig files, passwords, tokens, private keys, or other lab credentials to Git.
 
 ## 4. Configure Secure Shell (SSH) and upload the kubeconfig
 
@@ -48,7 +48,7 @@ On the Ubuntu host, first create a protected Kubernetes configuration directory:
 mkdir -p "$HOME/.kube" && chmod 700 "$HOME/.kube"
 ```
 
-Transfer the downloaded kubeconfig with SecureCRT SFTP and save it as `$HOME/.kube/lab01.conf`. Restrict access and test it on Ubuntu:
+Download the kubeconfig from reservation **Download kubeconfig**; save it locally as `lab01.conf` in `C:\Users\YOUR_USERNAME\Downloads`. Transfer with SecureCRT SFTP using `lcd C:\Users\YOUR_USERNAME\Downloads`, `cd /home/automation/.kube`, and `put lab01.conf`. Save it as `$HOME/.kube/lab01.conf`. Restrict access and test it on Ubuntu:
 
 ```bash
 chmod 600 "$HOME/.kube/lab01.conf"
@@ -60,11 +60,11 @@ For the tested SecureCRT file-transfer procedure and exact steps, continue in [S
 
 ## 5. Transfer the installer ZIP and run the read-only plan
 
-Follow the instructions in [README-START-HERE.md](../README-START-HERE.md) to transfer and unpack the **downloaded release ZIP** into a new versioned directory on Ubuntu (do not overwrite an earlier validated workspace). Run the read-only `plan` first, examine the selected cluster, external Storage Scale endpoint, and storage devices, and confirm the environment is healthy.
+Follow the instructions in [README-START-HERE.md](../README-START-HERE.md) to transfer and unpack the **downloaded release ZIP** into a new versioned directory on Ubuntu (do not overwrite an earlier validated workspace). Run the read-only `plan` first, examine the selected cluster, external Storage Scale endpoint, and storage devices, and confirm the environment is healthy. The `plan` does **not** change cluster resources; it also does not yet validate the external Scale GUI password.
 
 ## 6. Deploy only after reviewing the plan
 
-Run the installer `deploy` only when you have positively identified the **intentionally disposable Ceph disks** and are authorized to make changes to your disposable TechZone reservation. Deploy can erase those disks and may reboot cluster nodes. Follow the post-install validation steps in [README-START-HERE.md](../README-START-HERE.md) and review the [live validation record](../VALIDATED-LAB01-RESULT.md).
+Run the installer `deploy` only when you have positively identified the **intentionally disposable Ceph disks** and are authorized to make changes to your disposable TechZone reservation. Deploy can erase those disks and may reboot cluster nodes. Expect roughly **40 minutes** in a healthy lab. The deploy command prompts for the **Scale GUI username** (press Enter to accept `csi-storage-gui-user`) and the **hidden Scale GUI password** (enter it from the lab guide). Follow the post-install validation steps in [README-START-HERE.md](../README-START-HERE.md), and see the [Scale troubleshooting/resume guide](LAB01-SCALE-TROUBLESHOOTING.md) if authentication fails. Review the [November 12 v2.3 validation record](07-LIVE-VALIDATION-2026-11-12.md).
 
 ## Experienced Ansible user?
 
