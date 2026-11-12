@@ -1,5 +1,15 @@
 # IBM Fusion TechZone Automation
 
+<!-- BEGIN V3.1 ONBOARDING -->
+## New to Ansible? Start here first
+
+**Starting from a Windows PC without an Ansible server?** Follow the [step-by-step getting started guide](docs/GETTING-STARTED-FROM-ZERO.md). It starts with an Ubuntu automation VM, installs Python/Ansible/OpenShift CLI, and walks through downloading the Lab 1 installer and connecting to IBM TechZone.
+
+**Already have an Ubuntu Ansible control node?** Use the [Lab 1 installer instructions](README-START-HERE.md) directly.
+
+**Installer ZIP:** use the packaged installer asset under [GitHub Releases](https://github.com/ryanbeaty-ibm/ibm-fusion-techzone-automation/releases). If no installer asset is published, the maintainer must [publish the package](docs/PUBLISH-RELEASE-ARCHIVE.md); **Code > Download ZIP** is a repository source archive, not necessarily the packaged installer.
+<!-- END V3.1 ONBOARDING -->
+
 **One-command Ansible automation for IBM Fusion Level 4 hands-on labs.**
 
 This repository provides repeatable deployment and verification for the **IBM Fusion Level 4** training environment on **IBM Technology Zone (TechZone)**. The first supported workflow is **Lab 1 — Installation and Configuration**, covering IBM Fusion, Fusion Data Foundation / Ceph, and an IBM Storage Scale client attached to the lab's *already deployed* Scale server.
@@ -20,8 +30,7 @@ This repository provides repeatable deployment and verification for the **IBM Fu
 
 *Coverage note:* Lab 1 currently automates the **installation and persistent-storage portion** of the exercise, not every section of the workbook. Labs 2–5 are planned repository additions; no automation for them is included yet.
 
-## Quick start — Lab 1
-
+## Quick start — Lab 1 (existing Ansible control node)
 **Prerequisites:** A fresh TechZone OCP 4.21.x reservation; a reachable Ubuntu host with Ansible and `oc`; the reservation's kubeconfig; an existing external Scale GUI endpoint and credentials; and a confirmed disposable disk on each of three infrastructure nodes. See [setup instructions](README-START-HERE.md) and [prerequisites](docs/00-PREREQUISITES.md).
 
 1. Download your reservation's kubeconfig and store it **outside** the Git repository.

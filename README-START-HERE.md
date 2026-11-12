@@ -4,6 +4,15 @@ The installer automates Fusion/Ceph installation, Scale client deployment, conne
 
 **Current release:** v2.3 cleanup candidate. The preceding v2.2 release passed a fresh-cluster end-to-end test on November 11, 2026. Read the [live validation record](docs/06-LIVE-VALIDATION-2026-11-11.md).
 
+<!-- BEGIN V3.1 INSTALLER-ENTRY -->
+## Before Step 1 - Set up your automation environment
+
+**This installer guide assumes you already have an Ubuntu Ansible control node** with Python, Ansible, OpenShift CLI (`oc`), SSH and network access to your TechZone reservation. If you are starting from scratch, follow [Getting started from zero](docs/GETTING-STARTED-FROM-ZERO.md) first. Windows Hyper-V is one example; other compatible Ubuntu hosts work too.
+
+**Download the packaged installer ZIP** from the repository's [Releases page](https://github.com/ryanbeaty-ibm/ibm-fusion-techzone-automation/releases) under the release's **Assets**. If the ZIP is not there yet, the maintainer needs to [publish it](docs/PUBLISH-RELEASE-ARCHIVE.md). Do not mistake GitHub's automatic source-code ZIP for the installer package.
+
+**Version caution:** v2.3 is identified as a cleanup candidate in this repository; v2.2 is the preceding end-to-end validated release. Verify the chosen package's validation status before deployment.
+<!-- END V3.1 INSTALLER-ENTRY -->
 ## 1 — Download a fresh TechZone kubeconfig
 
 On your Windows computer, download the kubeconfig from your current IBM TechZone reservation. Rename it to a descriptive name such as `newlab.conf` and store it temporarily outside any Git repository. Record the new cluster prefix (`itz-...`), the **existing** external Scale server's management address and the disk assigned to Ceph on each infra node.
