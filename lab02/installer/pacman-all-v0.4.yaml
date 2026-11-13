@@ -1,0 +1,128 @@
+# Lab-only adaptation of https://github.com/matt-levan/fusion-l4-material/blob/main/backuprestore-lab/pacman-all.yaml
+# IMPORTANT: MongoDB authentication is disabled here for this isolated, disposable lab only.
+# The IBM example recipe's root-password commands have been adapted to match this configuration.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mongo-storage
+  labels:
+    app.kubernetes.io/part-of: fusion-lab02
+spec:
+  storageClassName: ocs-storagecluster-ceph-rbd
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 8Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongodb
+  labels:
+    app: mongodb
+    name: mongodb
+    app.kubernetes.io/part-of: fusion-lab02
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: mongodb
+  template:
+    metadata:
+      labels:
+        name: mongodb
+        app: mongodb
+    spec:
+      containers:
+        - name: mongodb
+          image: docker.io/bitnamilegacy/mongodb:5.0.24-debian-11-r20
+          env:
+            - name: ALLOW_EMPTY_PASSWORD
+              value: "yes"
+          ports:
+            - name: mongodb
+              containerPort: 27017
+          volumeMounts:
+            - name: mongo-db
+              mountPath: /bitnami/mongodb/data/db
+      volumes:
+        - name: mongo-db
+          persistentVolumeClaim:
+            claimName: mongo-storage
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo
+  labels:
+    name: mongodb
+spec:
+  type: ClusterIP
+  ports:
+    - port: 27017
+      targetPort: 27017
+  selector:
+    name: mongodb
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pacman
+  labels:
+    name: pacman
+    app.kubernetes.io/part-of: fusion-lab02
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: pacman
+  template:
+    metadata:
+      labels:
+        name: pacman
+    spec:
+      containers:
+        - name: pacman
+          image: quay.io/jpacker/nodejs-pacman-app:latest
+          env:
+            - name: ALLOW_EMPTY_PASSWORD
+              value: "yes"
+          ports:
+            - name: http-server
+              containerPort: 8080
+      initContainers:
+        - name: db-check
+          image: docker.io/library/busybox:1.36.1
+          command: [sh, -c, 'until nc -z mongo 27017; do sleep 2; done']
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pacman
+  labels:
+    name: pacman
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+  selector:
+    name: pacman
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: pacman
+  labels:
+    app.kubernetes.io/name: pacman
+spec:
+  path: /
+  to:
+    kind: Service
+    name: pacman
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None

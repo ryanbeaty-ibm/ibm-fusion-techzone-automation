@@ -1,0 +1,18 @@
+---
+# Non-secret example from the November 2026 TechZone validation.
+# COPY this to config/environment.yml and EDIT ALL cluster identities for YOUR reservations.
+# Kubernetes kubeconfig files and generated tokens must NOT be put in this repository.
+lab02_kubeconfig: "{{ lookup('env', 'HOME') }}/.kube/lab02.conf"
+hub_kubeconfig: "{{ lookup('env', 'HOME') }}/.kube/lab02.conf"
+spoke_kubeconfig: "{{ lookup('env', 'HOME') }}/.kube/lab01.conf"
+expected_hub_api_fragment: api.itz-t63twk.infra01-lb.wdc07.techzone.ibm.com
+expected_hub_s3_route_prefix: s3-openshift-storage.apps.itz-t63twk.
+hub_api_fragment: api.itz-t63twk.infra01-lb.wdc07.techzone.ibm.com
+spoke_api_fragment: api.itz-2xvmb0.infra01-lb.wdc04.techzone.ibm.com
+# Retrieve exact value via: oc --kubeconfig=$HOME/.kube/lab02.conf get cluster -A
+spoke_cluster_name: apps.itz-2xvmb0.infra01-lb.wdc04.techzone.ibm.com
+# Used for separate-cluster service protection storage (v0.5).
+service_protection_obc_namespace: fusion-lab02-protection
+service_protection_obc_name: lab02-service-protection
+service_protection_cert_secret: lab02-service-protection-cert
+service_protection_s3_route: s3-openshift-storage.apps.itz-2xvmb0.infra01-lb.wdc04.techzone.ibm.com

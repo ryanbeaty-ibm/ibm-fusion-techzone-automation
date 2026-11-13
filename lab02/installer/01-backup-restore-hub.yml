@@ -1,0 +1,92 @@
+---
+- name: Lab 02 | Deploy IBM Fusion Backup and Restore hub
+  hosts: localhost
+  gather_facts: false
+  vars:
+    lab02_kubeconfig: "{{ lookup('env', 'HOME') }}/.kube/lab02.conf"
+  environment:
+    KUBECONFIG: "{{ lab02_kubeconfig }}"
+  tasks:
+    - name: Confirm target API
+      ansible.builtin.command: oc whoami --show-server
+      register: target_api
+      changed_when: false
+      check_mode: false
+
+    - name: Refuse anything except Lab 02
+      ansible.builtin.assert:
+        that:
+          - "expected_hub_api_fragment in target_api.stdout"
+        fail_msg: "Wrong hub cluster; expected API fragment {{ expected_hub_api_fragment }}. No changes made."
+
+    - name: Inspect RBD StorageClass
+      ansible.builtin.command: oc get sc ocs-storagecluster-ceph-rbd -o json
+      register: rbd_sc
+      changed_when: false
+      check_mode: false
+
+    - name: Inspect RBD VolumeSnapshotClass
+      ansible.builtin.command: oc get volumesnapshotclass ocs-storagecluster-rbdplugin-snapclass -o json
+      register: rbd_snap
+      changed_when: false
+      check_mode: false
+
+    - name: Verify CSI storage and snapshot compatibility
+      ansible.builtin.assert:
+        that:
+          - "(rbd_sc.stdout | from_json).provisioner == 'openshift-storage.rbd.csi.ceph.com'"
+          - "(rbd_sc.stdout | from_json).volumeBindingMode == 'Immediate'"
+          - "(rbd_snap.stdout | from_json).driver == (rbd_sc.stdout | from_json).provisioner"
+
+    - name: Check existing Backup and Restore instance
+      ansible.builtin.command: >-
+        oc get fusionserviceinstance ibm-backup-restore-service-instance
+        -n ibm-spectrum-fusion-ns -o json --ignore-not-found
+      register: existing_hub
+      changed_when: false
+      check_mode: false
+
+    - name: Reject incompatible existing service instance
+      ansible.builtin.assert:
+        that:
+          - "(existing_hub.stdout | from_json).spec.serviceDefinition == 'ibm-backup-restore-service'"
+          - "(existing_hub.stdout | from_json).spec.doInstall | bool"
+          - "((existing_hub.stdout | from_json).spec.parameters | selectattr('name', 'equalto', 'storageClass') | map(attribute='value') | first | default('')) == 'ocs-storagecluster-ceph-rbd'"
+          - "((existing_hub.stdout | from_json).spec.parameters | selectattr('name', 'equalto', 'namespace') | map(attribute='value') | first | default('')) == 'ibm-backup-restore'"
+        fail_msg: "Existing instance differs from Lab 02 configuration. No changes made."
+      when: existing_hub.stdout | trim != ''
+
+    - name: Install the Backup and Restore hub only if absent
+      ansible.builtin.command:
+        argv: [oc, apply, -f, '-']
+        stdin: |
+          apiVersion: service.isf.ibm.com/v1
+          kind: FusionServiceInstance
+          metadata:
+            name: ibm-backup-restore-service-instance
+            namespace: ibm-spectrum-fusion-ns
+          spec:
+            serviceDefinition: ibm-backup-restore-service
+            enabled: true
+            doInstall: true
+            triggerUpdate: false
+            parameters:
+              - {name: namespace, provided: false, value: ibm-backup-restore}
+              - {name: storageClass, provided: true, value: ocs-storagecluster-ceph-rbd}
+              - {name: doInstall, provided: false, value: 'true'}
+              - {name: autoUpgrade, provided: false, value: 'true'}
+      when:
+        - existing_hub.stdout | trim == ''
+        - not ansible_check_mode
+
+    - name: Display installation status
+      ansible.builtin.command: >-
+        oc get fusionserviceinstance ibm-backup-restore-service-instance
+        -n ibm-spectrum-fusion-ns
+      register: hub_status
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg: "{{ hub_status.stdout | default('Check mode: no installation submitted') }}"

@@ -1,0 +1,21 @@
+# Do not commit kubeconfigs, cluster credentials, generated connection YAML, private certificates, or secrets.
+**/BackupAndRestoreAgentDeployment.yaml
+**/*kubeconfig*
+**/kubeconfig
+**/*.kubeconfig
+**/*.conf
+**/.kube/
+**/*credentials*.json
+**/*secret*.json
+**/*.key
+**/*.pem
+**/*.p12
+**/*.pfx
+**/.env
+**/.env.*
+config/environment.yml
+*.retry
+*.log
+__pycache__/
+.DS_Store
+.venv/

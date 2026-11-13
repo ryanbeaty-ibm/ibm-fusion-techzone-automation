@@ -1,0 +1,75 @@
+---
+- name: Lab 02 v0.5 | Read-only service protection storage preflight
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    hub_kubeconfig: "{{ lookup('env', 'HOME') }}/.kube/lab02.conf"
+    spoke_kubeconfig: "{{ lookup('env', 'HOME') }}/.kube/lab01.conf"
+    hub_api_fragment: api.itz-t63twk.infra01-lb.wdc07.techzone.ibm.com
+    spoke_api_fragment: api.itz-2xvmb0.infra01-lb.wdc04.techzone.ibm.com
+    service_protection_obc_namespace: fusion-lab02-protection
+    service_protection_obc_name: lab02-service-protection
+    service_protection_cert_secret: lab02-service-protection-cert
+    service_protection_s3_route: s3-openshift-storage.apps.itz-2xvmb0.infra01-lb.wdc04.techzone.ibm.com
+  tasks:
+    - name: Identify hub
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ hub_kubeconfig }}", whoami, --show-server]
+      changed_when: false
+      check_mode: false
+      register: hub_api
+    - name: Identify second cluster
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ spoke_kubeconfig }}", whoami, --show-server]
+      changed_when: false
+      check_mode: false
+      register: spoke_api
+    - name: Refuse crossed or unexpected kubeconfigs
+      ansible.builtin.assert:
+        that:
+          - hub_api_fragment in hub_api.stdout
+          - spoke_api_fragment in spoke_api.stdout
+          - hub_api.stdout != spoke_api.stdout
+    - name: Read dedicated Object Bucket Claim
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ spoke_kubeconfig }}", -n, "{{ service_protection_obc_namespace }}", get, obc, "{{ service_protection_obc_name }}", -o, json]
+      register: protection_obc
+      changed_when: false
+      check_mode: false
+    - name: Require dedicated bucket is bound
+      ansible.builtin.assert:
+        that:
+          - "(protection_obc.stdout | from_json).status.phase == 'Bound'"
+    - name: Verify generated bucket metadata is present
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ spoke_kubeconfig }}", -n, "{{ service_protection_obc_namespace }}", get, configmap, "{{ service_protection_obc_name }}", -o, json]
+      register: bucket_metadata
+      changed_when: false
+      check_mode: false
+    - name: Require generated bucket name
+      ansible.builtin.assert:
+        that:
+          - "(bucket_metadata.stdout | from_json).data.BUCKET_NAME | length > 0"
+    - name: Confirm OBC credential Secret exists without reading its contents
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ spoke_kubeconfig }}", -n, "{{ service_protection_obc_namespace }}", get, secret, "{{ service_protection_obc_name }}", -o, name]
+      changed_when: false
+      check_mode: false
+      no_log: true
+    - name: Verify hub certificate Secret exists
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ hub_kubeconfig }}", -n, ibm-spectrum-fusion-ns, get, secret, "{{ service_protection_cert_secret }}", -o, name]
+      changed_when: false
+      check_mode: false
+    - name: Verify external S3 route can answer HTTPS without credentials
+      ansible.builtin.command:
+        argv: [curl, -sS, --connect-timeout, '10', --max-time, '25', -o, /dev/null, -w, '%{http_code}', "https://{{ service_protection_s3_route }}"]
+      register: https_probe
+      changed_when: false
+      check_mode: false
+    - name: Require responding S3 endpoint
+      ansible.builtin.assert:
+        that:
+          - "(https_probe.stdout | trim) in ['400', '401', '403']"
+        success_msg: "S3 prerequisites present. Finish and VERIFY the Service Protection backup in the Fusion UI."

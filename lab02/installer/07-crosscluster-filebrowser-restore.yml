@@ -1,0 +1,279 @@
+---
+- name: Lab 02 v0.7 | Idempotent FileBrowser hub-to-spoke recovery and SHA-256 verification
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    hub_kubeconfig: "{{ lookup('env', 'HOME') }}/.kube/lab02.conf"
+    spoke_kubeconfig: "{{ lookup('env', 'HOME') }}/.kube/lab01.conf"
+    hub_api_fragment: api.itz-t63twk.infra01-lb.wdc07.techzone.ibm.com
+    spoke_api_fragment: api.itz-2xvmb0.infra01-lb.wdc04.techzone.ibm.com
+    spoke_cluster_name: apps.itz-2xvmb0.infra01-lb.wdc04.techzone.ibm.com
+    fusion_namespace: ibm-spectrum-fusion-ns
+    source_namespace: filebrowser
+    target_namespace: filebrowser
+    source_application: filebrowser
+    source_backup: filebrowser-lab02-v03-backup
+    backup_location: hubspoke-bucket
+    crosscluster_restore: filebrowser-lab02-v07-restore
+    target_storage_class: ocs-storagecluster-ceph-rbd
+    filebrowser_proof: lab02-proof-v03.bin
+    lab_managed_by: lab02-ansible
+    poll_seconds: 15
+    restore_timeout_seconds: 1800
+    deployment_timeout_seconds: 420
+  tasks:
+    - name: Confirm Hub OpenShift API endpoint
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ hub_kubeconfig }}", whoami, --show-server]
+      changed_when: false
+      check_mode: false
+      register: hub_api
+
+    - name: Confirm Spoke OpenShift API endpoint
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ spoke_kubeconfig }}", whoami, --show-server]
+      changed_when: false
+      check_mode: false
+      register: spoke_api
+
+    - name: Refuse to run with swapped or unexpected cluster contexts
+      ansible.builtin.assert:
+        that:
+          - "hub_api_fragment in hub_api.stdout"
+          - "spoke_api_fragment in spoke_api.stdout"
+          - "hub_api.stdout != spoke_api.stdout"
+        fail_msg: >-
+          Wrong clusters. Hub must match {{ hub_api_fragment }} and spoke {{ spoke_api_fragment }}.
+          No restore will be created.
+
+    - name: Verify the source S3 BackupStorageLocation is connected
+      ansible.builtin.command:
+        argv:
+          - oc
+          - "--kubeconfig={{ hub_kubeconfig }}"
+          - -n
+          - "{{ fusion_namespace }}"
+          - get
+          - backupstoragelocations.data-protection.isf.ibm.com
+          - "{{ backup_location }}"
+          - -o
+          - json
+      register: s3_location
+      changed_when: false
+      check_mode: false
+
+    - name: Require a connected source S3 backup location
+      ansible.builtin.assert:
+        that:
+          - "(s3_location.stdout | from_json).status.phase == 'Connected'"
+        fail_msg: "Source backup location {{ backup_location }} is not Connected."
+
+    - name: Read existing FileBrowser backup on hub
+      ansible.builtin.command:
+        argv:
+          - oc
+          - "--kubeconfig={{ hub_kubeconfig }}"
+          - -n
+          - "{{ fusion_namespace }}"
+          - get
+          - backups.data-protection.isf.ibm.com
+          - "{{ source_backup }}"
+          - -o
+          - json
+      register: backup_json
+      changed_when: false
+      check_mode: false
+
+    - name: Require the exact previously validated FileBrowser backup
+      ansible.builtin.assert:
+        that:
+          - "(backup_json.stdout | from_json).status.phase == 'Completed'"
+          - "(backup_json.stdout | from_json).spec.application == source_application"
+          - "(backup_json.stdout | from_json).metadata.labels.get('app.kubernetes.io/managed-by', '') == lab_managed_by"
+        fail_msg: "The expected v0.3 FileBrowser backup is unavailable or does not belong to this lab."
+
+    - name: Read Fusion registered clusters from the hub
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ hub_kubeconfig }}", get, cluster, -A, -o, json]
+      register: registered_clusters
+      changed_when: false
+      check_mode: false
+
+    - name: Confirm exactly one registered spoke has the intended cluster name
+      ansible.builtin.assert:
+        that:
+          - >-
+            ((registered_clusters.stdout | from_json)['items'] |
+            selectattr('metadata.name', 'equalto', spoke_cluster_name) | list | length) == 1
+        fail_msg: >-
+          Spoke {{ spoke_cluster_name }} is not uniquely registered in the hub.
+          Verify IBM Fusion Backup & Restore > Topology before continuing.
+
+    - name: Confirm the spoke has the required RBD StorageClass
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ spoke_kubeconfig }}", get, storageclass, "{{ target_storage_class }}", -o, name]
+      changed_when: false
+      check_mode: false
+
+    - name: Read destination FileBrowser namespace without altering it
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ spoke_kubeconfig }}", get, namespace, "{{ target_namespace }}", -o, json, --ignore-not-found]
+      register: destination_namespace
+      changed_when: false
+      check_mode: false
+
+    - name: Check for the previously created cross-cluster restore
+      ansible.builtin.command:
+        argv:
+          - oc
+          - "--kubeconfig={{ hub_kubeconfig }}"
+          - -n
+          - "{{ fusion_namespace }}"
+          - get
+          - restores.data-protection.isf.ibm.com
+          - "{{ crosscluster_restore }}"
+          - -o
+          - json
+          - --ignore-not-found
+      register: existing_restore
+      changed_when: false
+      check_mode: false
+
+    - name: Refuse to overwrite an unrelated existing restore
+      ansible.builtin.assert:
+        that:
+          - "(existing_restore.stdout | from_json).metadata.labels.get('app.kubernetes.io/managed-by', '') == lab_managed_by"
+          - "(existing_restore.stdout | from_json).spec.backup == source_backup"
+          - "(existing_restore.stdout | from_json).spec.targetCluster == spoke_cluster_name"
+          - "(existing_restore.stdout | from_json).spec.get('overwrite', false) == false"
+        fail_msg: "Restore name exists but has a different backup, target, or owner. No changes made."
+      when: existing_restore.stdout | trim != ''
+
+    - name: Refuse a first restore into an already-existing destination namespace
+      ansible.builtin.assert:
+        that:
+          - "destination_namespace.stdout | trim == ''"
+        fail_msg: >-
+          Target namespace {{ target_namespace }} exists on the spoke, but the named
+          restore does not. Refusing to overwrite existing spoke resources.
+      when: existing_restore.stdout | trim == ''
+
+    - name: Create exactly one cross-cluster FileBrowser restore when absent
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ hub_kubeconfig }}", create, -f, '-']
+        stdin: |
+          apiVersion: data-protection.isf.ibm.com/v1alpha1
+          kind: Restore
+          metadata:
+            name: {{ crosscluster_restore }}
+            namespace: {{ fusion_namespace }}
+            labels:
+              app.kubernetes.io/managed-by: {{ lab_managed_by }}
+              app.kubernetes.io/part-of: fusion-lab02
+          spec:
+            backup: {{ source_backup }}
+            targetCluster: {{ spoke_cluster_name }}
+            overwrite: false
+      when:
+        - not ansible_check_mode
+        - existing_restore.stdout | trim == ''
+
+    - name: Wait for the named cross-cluster restore to finish or fail
+      ansible.builtin.command:
+        argv:
+          - oc
+          - "--kubeconfig={{ hub_kubeconfig }}"
+          - -n
+          - "{{ fusion_namespace }}"
+          - get
+          - restores.data-protection.isf.ibm.com
+          - "{{ crosscluster_restore }}"
+          - -o
+          - 'jsonpath={.status.phase}'
+      register: restore_phase
+      changed_when: false
+      until: (restore_phase.stdout | trim) in ['Completed', 'Failed', 'Error', 'Cancelled', 'RecipeFailed', 'PartiallyFailed', 'PartiallyCompleted']
+      retries: "{{ (restore_timeout_seconds // poll_seconds) | int }}"
+      delay: "{{ poll_seconds }}"
+      when: not ansible_check_mode
+
+    - name: Require the cross-cluster restore to be completed
+      ansible.builtin.assert:
+        that:
+          - "(restore_phase.stdout | trim) == 'Completed'"
+        fail_msg: >-
+          Cross-cluster restore {{ crosscluster_restore }} ended as
+          {{ restore_phase.stdout | trim }}. Inspect the hub Restore CR status messages.
+      when: not ansible_check_mode
+
+    - name: Wait for the recovered FileBrowser deployment on the spoke
+      ansible.builtin.command:
+        argv:
+          - oc
+          - "--kubeconfig={{ spoke_kubeconfig }}"
+          - -n
+          - "{{ target_namespace }}"
+          - rollout
+          - status
+          - deployment/filebrowser
+          - "--timeout={{ deployment_timeout_seconds }}s"
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Verify both destination persistent volume claims are bound
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ spoke_kubeconfig }}", -n, "{{ target_namespace }}", get, pvc, -o, json]
+      register: spoke_pvcs
+      changed_when: false
+      until: >-
+        ((spoke_pvcs.stdout | from_json)['items'] | selectattr('metadata.name', 'in', ['files','filebrowser-config']) |
+         selectattr('status.phase', 'equalto', 'Bound') | list | length) == 2
+      retries: "{{ (deployment_timeout_seconds // poll_seconds) | int }}"
+      delay: "{{ poll_seconds }}"
+      when: not ansible_check_mode
+
+    - name: Calculate original SHA-256 from hub FileBrowser persistent data
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ hub_kubeconfig }}", -n, "{{ source_namespace }}", exec, deployment/filebrowser, --, sha256sum, "/files/{{ filebrowser_proof }}"]
+      register: source_sha
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Calculate recovered SHA-256 from spoke FileBrowser persistent data
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ spoke_kubeconfig }}", -n, "{{ target_namespace }}", exec, deployment/filebrowser, --, sha256sum, "/files/{{ filebrowser_proof }}"]
+      register: recovered_sha
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Confirm restored data is identical to original data
+      ansible.builtin.assert:
+        that:
+          - "source_sha.stdout.split()[0] is match('^[a-f0-9]{64}$')"
+          - "recovered_sha.stdout.split()[0] is match('^[a-f0-9]{64}$')"
+          - "source_sha.stdout.split()[0] == recovered_sha.stdout.split()[0]"
+        fail_msg: "CROSS-CLUSTER DATA INTEGRITY FAILED. SHA-256 does not match."
+        success_msg: "CROSS-CLUSTER DATA INTEGRITY PASSED: identical SHA-256 on hub and spoke."
+      when: not ansible_check_mode
+
+    - name: Print final cross-cluster recovery report
+      ansible.builtin.debug:
+        msg:
+          - "Hub: {{ hub_api.stdout | trim }}"
+          - "Spoke: {{ spoke_api.stdout | trim }}"
+          - "Source backup: {{ source_backup }} / Completed"
+          - "Restore: {{ crosscluster_restore }} / {{ restore_phase.stdout | trim }}"
+          - "Recovered application: {{ target_namespace }}/filebrowser / Ready"
+          - "Source SHA-256: {{ source_sha.stdout.split()[0] }}"
+          - "Spoke SHA-256: {{ recovered_sha.stdout.split()[0] }}"
+          - "Result: CROSS-CLUSTER DATA INTEGRITY PASSED"
+      when: not ansible_check_mode
+
+    - name: Explain preflight-only check mode
+      ansible.builtin.debug:
+        msg: >-
+          Preflight passed. Check mode will not create a Restore resource or run
+          a data check. Execute normally to adopt/verify an existing restore,
+          or start one if the target namespace does not exist.
+      when: ansible_check_mode

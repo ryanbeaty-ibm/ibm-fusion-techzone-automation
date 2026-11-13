@@ -1,0 +1,85 @@
+---
+- name: Lab 02 v0.6 | Apply a hub-generated short-lived spoke agent manifest safely
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    spoke_kubeconfig: "{{ lookup('env', 'HOME') }}/.kube/lab01.conf"
+    spoke_api_fragment: api.itz-2xvmb0.infra01-lb.wdc04.techzone.ibm.com
+    generated_spoke_manifest: "{{ lookup('env', 'HOME') }}/BackupAndRestoreAgentDeployment.yaml"
+    install_poll_seconds: 15
+    install_max_wait_seconds: 1800
+  tasks:
+    - name: Identify spoke API
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ spoke_kubeconfig }}", whoami, --show-server]
+      register: spoke_api
+      changed_when: false
+      check_mode: false
+    - name: Refuse to install on the wrong OpenShift cluster
+      ansible.builtin.assert:
+        that: [spoke_api_fragment in spoke_api.stdout]
+    - name: Check for installed agent service instance
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ spoke_kubeconfig }}", -n, ibm-spectrum-fusion-ns, get, fusionserviceinstance, ibm-backup-restore-agent-service-instance, -o, json, --ignore-not-found]
+      register: existing_agent
+      changed_when: false
+      check_mode: false
+    - name: Require existing agent has correct service definition
+      ansible.builtin.assert:
+        that:
+          - "(existing_agent.stdout | from_json).spec.serviceDefinition == 'ibm-backup-restore-agent-service'"
+        fail_msg: Existing agent instance has an unexpected service definition.
+      when: existing_agent.stdout | trim != ''
+    - name: Check that generated manifest is a regular local file
+      ansible.builtin.stat:
+        path: "{{ generated_spoke_manifest }}"
+      register: generated_file
+      when: existing_agent.stdout | trim == ''
+    - name: Require generated manifest when agent not installed
+      ansible.builtin.assert:
+        that:
+          - generated_file.stat.isreg | default(false)
+        fail_msg: Download deployment YAML from the HUB UI. Do not commit it.
+      when: existing_agent.stdout | trim == ''
+    - name: Server-side validate generated manifest on spoke
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ spoke_kubeconfig }}", apply, --dry-run=server, -f, "{{ generated_spoke_manifest }}"]
+      changed_when: false
+      check_mode: false
+      no_log: true
+      when: existing_agent.stdout | trim == ''
+    - name: Install connection and agent only if absent
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ spoke_kubeconfig }}", apply, -f, "{{ generated_spoke_manifest }}"]
+      no_log: true
+      when:
+        - existing_agent.stdout | trim == ''
+        - not ansible_check_mode
+    - name: Wait for spoke agent installation status
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ spoke_kubeconfig }}", -n, ibm-spectrum-fusion-ns, get, fusionserviceinstance, ibm-backup-restore-agent-service-instance, -o, 'jsonpath={.status.installStatus.status}']
+      register: agent_phase
+      changed_when: false
+      until: (agent_phase.stdout | trim) in ['Completed', 'Failed', 'Error']
+      retries: "{{ (install_max_wait_seconds // install_poll_seconds) | int }}"
+      delay: "{{ install_poll_seconds }}"
+      when: not ansible_check_mode
+    - name: Require agent installation completed
+      ansible.builtin.assert:
+        that:
+          - "(agent_phase.stdout | trim) == 'Completed'"
+        fail_msg: "Spoke agent phase: {{ agent_phase.stdout | trim }}"
+      when: not ansible_check_mode
+    - name: Count ready agent deployments
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ spoke_kubeconfig }}", -n, ibm-backup-restore, get, deployments, -o, json]
+      register: agent_deployments
+      changed_when: false
+      when: not ansible_check_mode
+    - name: Require all deployments available
+      ansible.builtin.assert:
+        that:
+          - "((agent_deployments.stdout | from_json)['items'] | length) >= 1"
+          - "(((agent_deployments.stdout | from_json)['items'] | selectattr('status.availableReplicas', 'defined') | list | length) == ((agent_deployments.stdout | from_json)['items'] | length))"
+      when: not ansible_check_mode

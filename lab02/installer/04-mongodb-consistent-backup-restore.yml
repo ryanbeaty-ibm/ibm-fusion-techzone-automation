@@ -1,0 +1,799 @@
+---
+- name: Lab 02 v0.4.4 | MongoDB recipe-consistent S3 backup, restore, and document proof
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    lab02_kubeconfig: "{{ lookup('env', 'HOME') }}/.kube/lab02.conf"
+    fusion_namespace: ibm-spectrum-fusion-ns
+    source_namespace: pacman
+    restored_namespace: pacman4
+    fusion_application_name: pacman
+    backup_policy_name: weekly-backup
+    backup_location_name: hubspoke-bucket
+    policy_assignment_name: pacman-lab02-weekly-recipe
+    backup_name: pacman-lab02-v044-backup
+    restore_name: pacman-lab02-v044-restore
+    recipe_name: mongodb-image-based-backup-restore-recipe
+    recipe_api_version: spp-data-protection.isf.ibm.com/v1alpha1
+    proof_record_id: lab02-v04-proof
+    proof_payload: "{{ ('FUSION_LAB02_MONGO_V04_DATA_PROOF-' * 1024) }}"
+    mongo_client_shell: >-
+      if command -v mongosh >/dev/null 2>&1; then
+        client=mongosh;
+      elif command -v mongo >/dev/null 2>&1; then
+        client=mongo;
+      else
+        echo 'No MongoDB shell found in image' >&2; exit 127;
+      fi;
+      "$client" --quiet --eval "$1"
+    mongo_write_js: >-
+      const d = db.getSiblingDB('fusion_lab02');
+      const payload = '{{ proof_payload }}';
+      const outcome = d.proof.updateOne({_id:'{{ proof_record_id }}'}, {$setOnInsert:{payload:payload}}, {upsert:true});
+      const doc = d.proof.findOne({_id:'{{ proof_record_id }}'});
+      if (!doc || doc.payload !== payload) { quit(42); }
+      print('FUSION_LAB02_MONGODB_PROOF_' + (outcome.upsertedCount > 0 ? 'CREATED' : 'EXISTS'));
+    mongo_read_js: >-
+      const d = db.getSiblingDB('fusion_lab02');
+      const doc = d.proof.findOne({_id:'{{ proof_record_id }}'});
+      if (!doc || typeof doc.payload !== 'string') { quit(43); }
+      print(doc.payload);
+    poll_seconds: 15
+    app_discovery_max_wait_seconds: 300
+    app_ready_max_wait_seconds: 420
+    backup_max_wait_seconds: 1800
+    restore_max_wait_seconds: 1800
+    pacman_manifest: "{{ playbook_dir }}/pacman-all-v0.4.yaml"
+    recipe_manifest: "{{ playbook_dir }}/mongodb-recipe-v0.4.yaml"
+    lab_managed_by: lab02-ansible
+  environment:
+    KUBECONFIG: "{{ lab02_kubeconfig }}"
+  tasks:
+    - name: Confirm current OpenShift API server
+      ansible.builtin.command: {argv: [oc, whoami, --show-server]}
+      register: cluster_api
+      changed_when: false
+      check_mode: false
+
+    - name: Refuse to modify any cluster except Lab 02
+      ansible.builtin.assert:
+        that:
+          - "expected_hub_api_fragment in cluster_api.stdout"
+        fail_msg: "Wrong hub cluster; expected API fragment {{ expected_hub_api_fragment }}. No changes made."
+
+    - name: Require bundled Pac-Man and MongoDB recipe manifests
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ pacman_manifest }}"
+        - "{{ recipe_manifest }}"
+      register: manifest_files
+
+    - name: Validate both manifests are present
+      ansible.builtin.assert:
+        that:
+          - item.stat.isreg | default(false)
+        fail_msg: "Missing required v0.4 manifest: {{ item.item }}"
+        quiet: true
+      loop: "{{ manifest_files.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Read existing S3 backup location
+      ansible.builtin.command:
+        argv: [oc, get, backupstoragelocations.data-protection.isf.ibm.com,
+               "{{ backup_location_name }}", -n, "{{ fusion_namespace }}", -o, json]
+      register: location_json
+      changed_when: false
+      check_mode: false
+
+    - name: Require a connected S3 backup location
+      ansible.builtin.assert:
+        that:
+          - "(location_json.stdout | from_json).status.phase == 'Connected'"
+        fail_msg: "S3 location is not Connected; validate Lab 02 v0.2 first."
+
+    - name: Read existing weekly backup policy
+      ansible.builtin.command:
+        argv: [oc, get, backuppolicies.data-protection.isf.ibm.com,
+               "{{ backup_policy_name }}", -n, "{{ fusion_namespace }}", -o, json]
+      register: policy_json
+      changed_when: false
+      check_mode: false
+
+    - name: Require weekly policy to target the connected S3 location
+      ansible.builtin.assert:
+        that:
+          - "(policy_json.stdout | from_json).spec.backupStorageLocation == backup_location_name"
+        fail_msg: "weekly-backup does not point to hubspoke-bucket."
+
+    - name: Check MongoDB application StorageClass
+      ansible.builtin.command:
+        argv: [oc, get, storageclass, ocs-storagecluster-ceph-rbd, -o, name]
+      changed_when: false
+      check_mode: false
+
+    - name: Validate MongoDB recipe against live Fusion Recipe CRD
+      ansible.builtin.command:
+        argv: [oc, apply, --dry-run=server, -f, "{{ recipe_manifest }}"]
+      changed_when: false
+      check_mode: false
+
+    - name: Inspect source namespace
+      ansible.builtin.command:
+        argv: [oc, get, namespace, "{{ source_namespace }}", -o, json, --ignore-not-found]
+      register: source_namespace_json
+      changed_when: false
+      check_mode: false
+
+    - name: Do not overwrite an unmanaged pre-existing source namespace
+      ansible.builtin.assert:
+        that:
+          - "(source_namespace_json.stdout | from_json).metadata.labels.get('app.kubernetes.io/managed-by', '') == lab_managed_by"
+        fail_msg: "pacman already exists but was not created by this lab; refusing to modify it."
+      when: source_namespace_json.stdout | trim != ''
+
+    - name: Create managed Pac-Man source namespace if absent
+      ansible.builtin.command:
+        argv: [oc, create, -f, '-']
+        stdin: |
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: {{ source_namespace }}
+            labels:
+              app.kubernetes.io/managed-by: {{ lab_managed_by }}
+              app.kubernetes.io/part-of: fusion-lab02
+      when:
+        - not ansible_check_mode
+        - source_namespace_json.stdout | trim == ''
+
+    - name: Detect Pac-Man manifest drift
+      ansible.builtin.command:
+        argv: [oc, diff, -n, "{{ source_namespace }}", -f, "{{ pacman_manifest }}"]
+      register: pacman_diff
+      changed_when: false
+      failed_when: pacman_diff.rc not in [0, 1]
+      when: not ansible_check_mode
+
+    - name: Deploy the bundled MongoDB and Pac-Man application
+      ansible.builtin.command:
+        argv: [oc, apply, -n, "{{ source_namespace }}", -f, "{{ pacman_manifest }}"]
+      register: pacman_apply
+      changed_when: "'created' in pacman_apply.stdout or 'configured' in pacman_apply.stdout"
+      when:
+        - not ansible_check_mode
+        - pacman_diff.rc == 1
+
+    - name: Wait for MongoDB PersistentVolumeClaim to bind
+      ansible.builtin.command:
+        argv: [oc, get, pvc, mongo-storage, -n, "{{ source_namespace }}", '-o', 'jsonpath={.status.phase}']
+      register: mongo_pvc_phase
+      changed_when: false
+      until: (mongo_pvc_phase.stdout | trim) == 'Bound'
+      retries: "{{ (app_ready_max_wait_seconds // poll_seconds) | int }}"
+      delay: "{{ poll_seconds }}"
+      when: not ansible_check_mode
+
+    - name: Wait until MongoDB deployment is ready
+      ansible.builtin.command:
+        argv: [oc, rollout, status, deployment/mongodb,
+               -n, "{{ source_namespace }}", "--timeout={{ app_ready_max_wait_seconds }}s"]
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Wait until Pac-Man deployment is ready
+      ansible.builtin.command:
+        argv: [oc, rollout, status, deployment/pacman,
+               -n, "{{ source_namespace }}", "--timeout={{ app_ready_max_wait_seconds }}s"]
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Wait for Fusion to discover Pac-Man as an Application
+      ansible.builtin.command:
+        argv: [oc, get, applications.application.isf.ibm.com,
+               "{{ fusion_application_name }}", -n, "{{ fusion_namespace }}",
+               -o, json, --ignore-not-found]
+      register: fusion_app
+      changed_when: false
+      until: (fusion_app.stdout | trim) != ''
+      retries: "{{ (app_discovery_max_wait_seconds // poll_seconds) | int }}"
+      delay: "{{ poll_seconds }}"
+      when: not ansible_check_mode
+
+    - name: Write unique proof document to MongoDB once and verify it
+      ansible.builtin.command:
+        argv:
+          - oc
+          - exec
+          - -n
+          - "{{ source_namespace }}"
+          - deployment/mongodb
+          - --
+          - /bin/bash
+          - -ec
+          - "{{ mongo_client_shell }}"
+          - _
+          - "{{ mongo_write_js }}"
+      register: mongo_write
+      changed_when: "'FUSION_LAB02_MONGODB_PROOF_CREATED' in mongo_write.stdout"
+      retries: 20
+      delay: 10
+      until: >-
+        mongo_write.rc == 0 and
+        ('FUSION_LAB02_MONGODB_PROOF_CREATED' in mongo_write.stdout or
+         'FUSION_LAB02_MONGODB_PROOF_EXISTS' in mongo_write.stdout)
+      when: not ansible_check_mode
+
+    - name: Query MongoDB source proof document
+      ansible.builtin.command:
+        argv: [oc, exec, -n, "{{ source_namespace }}", deployment/mongodb, --,
+               /bin/bash, -ec, "{{ mongo_client_shell }}", _, "{{ mongo_read_js }}"]
+      register: source_record
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Validate source MongoDB payload and calculate SHA-256
+      ansible.builtin.assert:
+        that:
+          - "(source_record.stdout | trim) == proof_payload"
+          - "(source_record.stdout | trim | hash('sha256') | length) == 64"
+        fail_msg: "MongoDB source record is missing or corrupted."
+        quiet: true
+      when: not ansible_check_mode
+
+    - name: Inspect an existing MongoDB Recipe before reconciling it
+      ansible.builtin.command:
+        argv: [oc, get, recipes.spp-data-protection.isf.ibm.com,
+               "{{ recipe_name }}", -n, "{{ fusion_namespace }}",
+               -o, json, --ignore-not-found]
+      register: existing_recipe
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Refuse to modify a pre-existing unmanaged MongoDB Recipe
+      ansible.builtin.assert:
+        that:
+          - "(existing_recipe.stdout | from_json).metadata.labels.get('app.kubernetes.io/managed-by', '') == lab_managed_by"
+        fail_msg: "A Recipe with the same name exists but is not Lab 02 managed; refusing to overwrite it."
+        quiet: true
+      when:
+        - not ansible_check_mode
+        - existing_recipe.stdout | trim != ''
+
+    - name: Detect MongoDB recipe manifest drift
+      ansible.builtin.command:
+        argv: [oc, diff, -f, "{{ recipe_manifest }}"]
+      register: recipe_diff
+      changed_when: false
+      failed_when: recipe_diff.rc not in [0, 1]
+      when: not ansible_check_mode
+
+    - name: Install or reconcile MongoDB application-consistency recipe
+      ansible.builtin.command:
+        argv: [oc, apply, -f, "{{ recipe_manifest }}"]
+      register: recipe_apply
+      changed_when: "'created' in recipe_apply.stdout or 'configured' in recipe_apply.stdout"
+      when:
+        - not ansible_check_mode
+        - recipe_diff.rc == 1
+
+    - name: Verify installed MongoDB recipe contains fsyncLock and fsyncUnlock
+      ansible.builtin.command:
+        argv: [oc, get, recipes.spp-data-protection.isf.ibm.com,
+               "{{ recipe_name }}", -n, "{{ fusion_namespace }}", -o, json]
+      register: mongo_recipe
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Require both MongoDB consistency hooks before assigning the policy
+      ansible.builtin.assert:
+        that:
+          - "'mongodb-pod-exec/fsyncLock' in ((mongo_recipe.stdout | from_json).spec.workflows | to_json)"
+          - "'mongodb-pod-exec/fsyncUnlock' in ((mongo_recipe.stdout | from_json).spec.workflows | to_json)"
+        quiet: true
+        fail_msg: "Recipe is missing a required MongoDB quiesce/unquiesce hook."
+      when: not ansible_check_mode
+
+    - name: Inspect prior Lab 02 policy assignment
+      ansible.builtin.command:
+        argv: [oc, get, policyassignments.data-protection.isf.ibm.com,
+               "{{ policy_assignment_name }}", -n, "{{ fusion_namespace }}",
+               -o, json, --ignore-not-found]
+      register: prior_assignment
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Refuse to overwrite an unmanaged assignment
+      ansible.builtin.assert:
+        that:
+          - "(prior_assignment.stdout | from_json).metadata.labels.get('app.kubernetes.io/managed-by', '') == lab_managed_by"
+          - "(prior_assignment.stdout | from_json).spec.application == fusion_application_name"
+          - "(prior_assignment.stdout | from_json).spec.backupPolicy == backup_policy_name"
+          - "(prior_assignment.stdout | from_json).spec.recipe.name == recipe_name"
+          - "(prior_assignment.stdout | from_json).spec.recipe.namespace == fusion_namespace"
+        fail_msg: "Conflicting PolicyAssignment: refusing to overwrite."
+      when:
+        - not ansible_check_mode
+        - prior_assignment.stdout | trim != ''
+
+    - name: Assign weekly policy without automatically re-triggering a backup
+      ansible.builtin.command:
+        argv: [oc, create, -f, '-']
+        stdin: |
+          apiVersion: data-protection.isf.ibm.com/v1alpha1
+          kind: PolicyAssignment
+          metadata:
+            name: {{ policy_assignment_name }}
+            namespace: {{ fusion_namespace }}
+            labels:
+              app.kubernetes.io/managed-by: {{ lab_managed_by }}
+              app.kubernetes.io/part-of: fusion-lab02
+          spec:
+            application: {{ fusion_application_name }}
+            backupPolicy: {{ backup_policy_name }}
+            runNow: false
+            recipe:
+              apiVersion: {{ recipe_api_version }}
+              name: {{ recipe_name }}
+              namespace: {{ fusion_namespace }}
+      when:
+        - not ansible_check_mode
+        - prior_assignment.stdout | trim == ''
+
+    - name: Inspect existing named on-demand backup
+      ansible.builtin.command:
+        argv: [oc, get, backups.data-protection.isf.ibm.com, "{{ backup_name }}",
+               -n, "{{ fusion_namespace }}", -o, json, --ignore-not-found]
+      register: prior_backup
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Reject conflicting backup name
+      ansible.builtin.assert:
+        that:
+          - "(prior_backup.stdout | from_json).metadata.labels.get('app.kubernetes.io/managed-by', '') == lab_managed_by"
+          - "(prior_backup.stdout | from_json).spec.application == fusion_application_name"
+          - "(prior_backup.stdout | from_json).spec.backupPolicy == backup_policy_name"
+          - "(prior_backup.stdout | from_json).spec.recipe.name == recipe_name"
+          - "(prior_backup.stdout | from_json).spec.recipe.namespace == fusion_namespace"
+        fail_msg: "Existing backup name belongs to another test; override backup_name and restore_name."
+      when:
+        - not ansible_check_mode
+        - prior_backup.stdout | trim != ''
+
+    - name: Start a single named on-demand S3 backup if absent
+      ansible.builtin.command:
+        argv: [oc, create, -f, '-']
+        stdin: |
+          apiVersion: data-protection.isf.ibm.com/v1alpha1
+          kind: Backup
+          metadata:
+            name: {{ backup_name }}
+            namespace: {{ fusion_namespace }}
+            labels:
+              app.kubernetes.io/managed-by: {{ lab_managed_by }}
+              app.kubernetes.io/part-of: fusion-lab02
+          spec:
+            application: {{ fusion_application_name }}
+            backupPolicy: {{ backup_policy_name }}
+            recipe:
+              apiVersion: {{ recipe_api_version }}
+              name: {{ recipe_name }}
+              namespace: {{ fusion_namespace }}
+      when:
+        - not ansible_check_mode
+        - prior_backup.stdout | trim == ''
+
+    - name: Poll on-demand backup until it completes or fails
+      ansible.builtin.command:
+        argv: [oc, get, backups.data-protection.isf.ibm.com, "{{ backup_name }}",
+               -n, "{{ fusion_namespace }}", '-o', 'jsonpath={.status.phase}']
+      register: backup_phase
+      changed_when: false
+      until: (backup_phase.stdout | trim) in ['Completed', 'Failed', 'Error', 'Cancelled', 'PartiallyFailed', 'PartiallyCompleted', 'RecipeFailed']
+      retries: "{{ (backup_max_wait_seconds // poll_seconds) | int }}"
+      delay: "{{ poll_seconds }}"
+      when: not ansible_check_mode
+
+    - name: Require successful backup
+      ansible.builtin.assert:
+        that:
+          - "(backup_phase.stdout | trim) == 'Completed'"
+        fail_msg: >-
+          S3 backup status: {{ backup_phase.stdout | trim }}.
+          Inspect: oc describe fbackup {{ backup_name }} -n {{ fusion_namespace }}
+      when: not ansible_check_mode
+
+    - name: Check existing alternate restore namespace
+      ansible.builtin.command:
+        argv: [oc, get, namespace, "{{ restored_namespace }}", -o, json, --ignore-not-found]
+      register: target_namespace_json
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Refuse to restore over unrelated namespace
+      ansible.builtin.assert:
+        that:
+          - "(target_namespace_json.stdout | from_json).metadata.labels.get('app.kubernetes.io/managed-by', '') == lab_managed_by"
+        fail_msg: "Restore target already exists but isn't managed by Lab 02."
+      when:
+        - not ansible_check_mode
+        - target_namespace_json.stdout | trim != ''
+
+    - name: Create empty, managed alternate namespace if needed
+      ansible.builtin.command:
+        argv: [oc, create, -f, '-']
+        stdin: |
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: {{ restored_namespace }}
+            labels:
+              app.kubernetes.io/managed-by: {{ lab_managed_by }}
+              app.kubernetes.io/part-of: fusion-lab02
+      when:
+        - not ansible_check_mode
+        - target_namespace_json.stdout | trim == ''
+
+    - name: Inspect existing named restore
+      ansible.builtin.command:
+        argv: [oc, get, restores.data-protection.isf.ibm.com, "{{ restore_name }}",
+               -n, "{{ fusion_namespace }}", -o, json, --ignore-not-found]
+      register: prior_restore
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Reject conflicting restore name
+      ansible.builtin.assert:
+        that:
+          - "(prior_restore.stdout | from_json).metadata.labels.get('app.kubernetes.io/managed-by', '') == lab_managed_by"
+          - "(prior_restore.stdout | from_json).spec.backup == backup_name"
+          - "(prior_restore.stdout | from_json).spec.namespaceMapping[source_namespace] == restored_namespace"
+        fail_msg: "Existing restore belongs to a different backup; choose a new restore_name."
+      when:
+        - not ansible_check_mode
+        - prior_restore.stdout | trim != ''
+
+    - name: Create recipe-guided restore into {{ restored_namespace }} if absent
+      ansible.builtin.command:
+        argv: [oc, create, -f, '-']
+        stdin: |
+          apiVersion: data-protection.isf.ibm.com/v1alpha1
+          kind: Restore
+          metadata:
+            name: {{ restore_name }}
+            namespace: {{ fusion_namespace }}
+            labels:
+              app.kubernetes.io/managed-by: {{ lab_managed_by }}
+              app.kubernetes.io/part-of: fusion-lab02
+          spec:
+            backup: {{ backup_name }}
+            namespaceMapping:
+              {{ source_namespace }}: {{ restored_namespace }}
+            overwrite: false
+      when:
+        - not ansible_check_mode
+        - prior_restore.stdout | trim == ''
+
+    - name: Poll restore until it completes or fails
+      ansible.builtin.command:
+        argv: [oc, get, restores.data-protection.isf.ibm.com, "{{ restore_name }}",
+               -n, "{{ fusion_namespace }}", '-o', 'jsonpath={.status.phase}']
+      register: restore_phase
+      changed_when: false
+      until: (restore_phase.stdout | trim) in ['Completed', 'Failed', 'Error', 'Cancelled', 'PartiallyFailed', 'PartiallyCompleted', 'RecipeFailed']
+      retries: "{{ (restore_max_wait_seconds // poll_seconds) | int }}"
+      delay: "{{ poll_seconds }}"
+      when: not ansible_check_mode
+
+    - name: Require successful restore
+      ansible.builtin.assert:
+        that:
+          - "(restore_phase.stdout | trim) == 'Completed'"
+        fail_msg: >-
+          Restore status: {{ restore_phase.stdout | trim }}.
+          Inspect: oc describe frestore {{ restore_name }} -n {{ fusion_namespace }}
+      when: not ansible_check_mode
+
+    # OpenShift can give the new namespace a different UID range. MongoDB's
+    # private WiredTiger files retain the original owner across a PV restore.
+    # Never change the source PVC; only repair the newly restored PVC.
+    - name: Read source namespace UID allocation
+      ansible.builtin.command:
+        argv: [oc, get, namespace, "{{ source_namespace }}", -o, json]
+      register: mongo_source_ns
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Read restored namespace UID allocation
+      ansible.builtin.command:
+        argv: [oc, get, namespace, "{{ restored_namespace }}", -o, json]
+      register: mongo_target_ns
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Record source and restore UID allocations
+      ansible.builtin.set_fact:
+        mongo_source_uid: "{{ ((mongo_source_ns.stdout | from_json).metadata.annotations['openshift.io/sa.scc.uid-range']).split('/')[0] }}"
+        mongo_target_uid: "{{ ((mongo_target_ns.stdout | from_json).metadata.annotations['openshift.io/sa.scc.uid-range']).split('/')[0] }}"
+      when: not ansible_check_mode
+
+    - name: Require numeric namespace UIDs and distinct target namespace
+      ansible.builtin.assert:
+        that:
+          - mongo_source_uid is match('^[0-9]+$')
+          - mongo_target_uid is match('^[0-9]+$')
+          - source_namespace != restored_namespace
+        quiet: true
+        fail_msg: "Unexpected UID range or restore mapped over source; refusing PVC repair."
+      when: not ansible_check_mode
+
+    - name: Read completed restore for ownership-repair safety
+      ansible.builtin.command:
+        argv: [oc, get, restores.data-protection.isf.ibm.com, "{{ restore_name }}", -n, "{{ fusion_namespace }}", -o, json]
+      register: mongo_active_restore
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Read restored MongoDB deployment health
+      ansible.builtin.command:
+        argv: [oc, get, deployment, mongodb, -n, "{{ restored_namespace }}", -o, json]
+      register: mongo_restored_deploy
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Check the restored application is the expected MongoDB deployment
+      ansible.builtin.assert:
+        that:
+          - "((mongo_restored_deploy.stdout | from_json).spec.template.spec.containers[0].name) == 'mongodb'"
+          - "((mongo_restored_deploy.stdout | from_json).spec.template.spec.volumes[0].persistentVolumeClaim.claimName) == 'mongo-storage'"
+        quiet: true
+        fail_msg: "Unexpected MongoDB deployment or PVC mapping; refusing ownership repair."
+      when: not ansible_check_mode
+
+    - name: Decide whether restored MongoDB ownership repair is needed
+      ansible.builtin.set_fact:
+        mongo_repair_needed: >-
+          {{ (mongo_source_uid != mongo_target_uid) and
+             (((mongo_restored_deploy.stdout | from_json).status.availableReplicas | default(0) | int) < 1) }}
+      when: not ansible_check_mode
+
+    - name: Repair restored MongoDB ownership only when startup is blocked by namespace UID mismatch
+      when:
+        - not ansible_check_mode
+        - mongo_repair_needed | bool
+      block:
+        - name: Require lab-managed alternate-namespace restore before filesystem repair
+          ansible.builtin.assert:
+            that:
+              - "(mongo_target_ns.stdout | from_json).metadata.labels.get('app.kubernetes.io/managed-by', '') == lab_managed_by"
+              - "(mongo_active_restore.stdout | from_json).metadata.labels.get('app.kubernetes.io/managed-by', '') == lab_managed_by"
+              - "(restore_phase.stdout | trim) == 'Completed'"
+            quiet: true
+
+        - name: Inspect existing temporary repair service account
+          ansible.builtin.command:
+            argv: [oc, get, serviceaccount, mongodb-repair, -n, "{{ restored_namespace }}", -o, name, --ignore-not-found]
+          register: mongo_existing_repair_sa
+          changed_when: false
+
+        - name: Refuse to take over an existing repair service account
+          ansible.builtin.assert:
+            that:
+              - mongo_existing_repair_sa.stdout | trim == ''
+            fail_msg: "mongodb-repair service account already exists; inspect and clean it manually before retrying."
+            quiet: true
+
+        - name: Inspect existing temporary repair Job
+          ansible.builtin.command:
+            argv: [oc, get, job, mongodb-ownership-repair, -n, "{{ restored_namespace }}", -o, name, --ignore-not-found]
+          register: mongo_existing_repair_job
+          changed_when: false
+
+        - name: Refuse to overwrite an existing temporary repair Job
+          ansible.builtin.assert:
+            that:
+              - mongo_existing_repair_job.stdout | trim == ''
+            fail_msg: "mongodb-ownership-repair Job already exists; inspect it before retrying."
+            quiet: true
+
+        - name: Scale down only the restored MongoDB deployment for safe ownership correction
+          ansible.builtin.command:
+            argv: [oc, scale, deployment/mongodb, -n, "{{ restored_namespace }}", '--replicas=0']
+          changed_when: true
+
+        - name: List remaining restored MongoDB pods
+          ansible.builtin.command:
+            argv: [oc, get, pod, -n, "{{ restored_namespace }}", -l, app=mongodb, -o, name]
+          register: mongo_pods_before_repair
+          changed_when: false
+
+        - name: Wait until restored MongoDB pods release the volume
+          ansible.builtin.command:
+            argv: [oc, wait, --for=delete, pod, -n, "{{ restored_namespace }}", -l, app=mongodb, '--timeout=120s']
+          changed_when: false
+          when: mongo_pods_before_repair.stdout | trim != ''
+
+        - name: Repair ownership using temporary minimal service account and privileged UID only
+          block:
+            - name: Create temporary service account for isolated PVC repair
+              ansible.builtin.command:
+                argv: [oc, create, serviceaccount, mongodb-repair, -n, "{{ restored_namespace }}"]
+              changed_when: true
+
+            - name: Grant temporary anyuid SCC to the repair service account only
+              ansible.builtin.command:
+                argv: [oc, adm, policy, add-scc-to-user, anyuid, -z, mongodb-repair, -n, "{{ restored_namespace }}"]
+              changed_when: true
+
+            - name: Run temporary MongoDB file ownership correction on restored PVC
+              ansible.builtin.command:
+                argv: [oc, create, -n, "{{ restored_namespace }}", -f, '-']
+                stdin: |
+                  apiVersion: batch/v1
+                  kind: Job
+                  metadata:
+                    name: mongodb-ownership-repair
+                    namespace: {{ restored_namespace }}
+                    labels:
+                      app.kubernetes.io/managed-by: {{ lab_managed_by }}
+                      app.kubernetes.io/part-of: fusion-lab02
+                  spec:
+                    backoffLimit: 0
+                    activeDeadlineSeconds: 180
+                    template:
+                      spec:
+                        serviceAccountName: mongodb-repair
+                        restartPolicy: Never
+                        containers:
+                          - name: repair
+                            image: docker.io/library/busybox:1.36.1
+                            securityContext:
+                              runAsUser: 0
+                            command:
+                              - /bin/sh
+                              - -ec
+                              - |
+                                set -eu
+                                FILE=/recovery/WiredTigerHS.wt
+                                test -f "$FILE"
+                                OWNER=$(stat -c %u "$FILE")
+                                echo "Before: $(stat -c '%u:%g %a %n' "$FILE")"
+                                if [ "$OWNER" = '{{ mongo_source_uid }}' ]; then
+                                  chown -R {{ mongo_target_uid }}:{{ mongo_target_uid }} /recovery
+                                elif [ "$OWNER" != '{{ mongo_target_uid }}' ]; then
+                                  echo "Unexpected WiredTiger owner UID $OWNER; refusing repair" >&2
+                                  exit 24
+                                fi
+                                echo "After: $(stat -c '%u:%g %a %n' "$FILE")"
+                                test "$(stat -c %u "$FILE")" = '{{ mongo_target_uid }}'
+                            volumeMounts:
+                              - name: mongodb-data
+                                mountPath: /recovery
+                        volumes:
+                          - name: mongodb-data
+                            persistentVolumeClaim:
+                              claimName: mongo-storage
+              changed_when: true
+
+            - name: Poll repair Job using completion counters rather than condition ordering
+              ansible.builtin.command:
+                argv: [oc, get, job, mongodb-ownership-repair, -n, "{{ restored_namespace }}", -o, json]
+              register: mongo_repair_phase
+              changed_when: false
+              until: >-
+                ((mongo_repair_phase.stdout | from_json).get('status', {}).get('succeeded', 0) | int) >= 1 or
+                ((mongo_repair_phase.stdout | from_json).get('status', {}).get('failed', 0) | int) >= 1
+              retries: 12
+              delay: 15
+
+            - name: Report repair Job result
+              ansible.builtin.command:
+                argv: [oc, logs, -n, "{{ restored_namespace }}", job/mongodb-ownership-repair]
+              register: mongo_repair_log
+              changed_when: false
+
+            - name: Require repaired MongoDB ownership
+              ansible.builtin.assert:
+                that:
+                  - "((mongo_repair_phase.stdout | from_json).get('status', {}).get('succeeded', 0) | int) >= 1"
+                  - "'After:' in mongo_repair_log.stdout"
+                fail_msg: "Restored MongoDB ownership repair failed; review Job logs."
+          always:
+            - name: Capture repair logs for troubleshooting if Job exists
+              ansible.builtin.command:
+                argv: [oc, logs, -n, "{{ restored_namespace }}", job/mongodb-ownership-repair, '--tail=30']
+              changed_when: false
+              failed_when: false
+              register: mongo_repair_final_log
+
+            - name: Delete temporary repair Job
+              ansible.builtin.command:
+                argv: [oc, delete, job, mongodb-ownership-repair, -n, "{{ restored_namespace }}", '--ignore-not-found=true']
+              register: mongo_repair_job_cleanup
+              changed_when: "'deleted' in mongo_repair_job_cleanup.stdout"
+
+            - name: Revoke repair service account anyuid permission
+              ansible.builtin.command:
+                argv: [oc, adm, policy, remove-scc-from-user, anyuid, -z, mongodb-repair, -n, "{{ restored_namespace }}"]
+              changed_when: true
+
+            - name: Delete temporary repair service account
+              ansible.builtin.command:
+                argv: [oc, delete, serviceaccount, mongodb-repair, -n, "{{ restored_namespace }}", '--ignore-not-found=true']
+              register: mongo_repair_sa_cleanup
+              changed_when: "'deleted' in mongo_repair_sa_cleanup.stdout"
+
+            - name: Restore intended MongoDB replica count
+              ansible.builtin.command:
+                argv: [oc, scale, deployment/mongodb, -n, "{{ restored_namespace }}", '--replicas=1']
+              changed_when: true
+
+    - name: Check temporary ownership-repair resources are absent
+      ansible.builtin.command:
+        argv: [oc, get, serviceaccount/mongodb-repair, job/mongodb-ownership-repair, -n, "{{ restored_namespace }}", -o, name, --ignore-not-found]
+      register: mongo_repair_cleanup_check
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Require temporary ownership-repair resources cleaned up
+      ansible.builtin.assert:
+        that:
+          - "(mongo_repair_cleanup_check.stdout | trim) == ''"
+        fail_msg: "Temporary MongoDB repair resources remain in {{ restored_namespace }}; inspect before reuse."
+        quiet: true
+      when: not ansible_check_mode
+
+    - name: Wait for restored MongoDB deployment to become ready
+      ansible.builtin.command:
+        argv: [oc, rollout, status, deployment/mongodb,
+               -n, "{{ restored_namespace }}", "--timeout={{ app_ready_max_wait_seconds }}s"]
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Wait for restored Pac-Man application to become ready
+      ansible.builtin.command:
+        argv: [oc, rollout, status, deployment/pacman,
+               -n, "{{ restored_namespace }}", "--timeout={{ app_ready_max_wait_seconds }}s"]
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Read original proof document from restored MongoDB
+      ansible.builtin.command:
+        argv: [oc, exec, -n, "{{ restored_namespace }}", deployment/mongodb, --,
+               /bin/bash, -ec, "{{ mongo_client_shell }}", _, "{{ mongo_read_js }}"]
+      register: restored_record
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Verify MongoDB document integrity after S3 restore
+      ansible.builtin.assert:
+        that:
+          - "(restored_record.stdout | trim) == proof_payload"
+          - "(source_record.stdout | trim | hash('sha256')) == (restored_record.stdout | trim | hash('sha256'))"
+        fail_msg: "DATA INTEGRITY FAILED: Restored MongoDB proof document differs from source."
+        success_msg: "DATA INTEGRITY PASSED: MongoDB proof document SHA-256 matches."
+      when: not ansible_check_mode
+
+    - name: Print concise final lab report
+      ansible.builtin.debug:
+        msg:
+          - "Hub API: {{ cluster_api.stdout | trim }}"
+          - "S3 location: {{ backup_location_name }} / Connected"
+          - "Fusion application: {{ fusion_application_name }}"
+          - "Backup: {{ backup_name }} / {{ backup_phase.stdout | trim }}"
+          - "Restore: {{ restore_name }} / {{ restore_phase.stdout | trim }}"
+          - "Source namespace: {{ source_namespace }}"
+          - "Restore namespace: {{ restored_namespace }}"
+          - "Recipe: {{ recipe_name }}"
+          - "Source MongoDB SHA-256: {{ source_record.stdout | trim | hash('sha256') }}"
+          - "Restored MongoDB SHA-256: {{ restored_record.stdout | trim | hash('sha256') }}"
+          - "Result: APPLICATION-CONSISTENT MONGODB DATA INTEGRITY PASSED"
+      when: not ansible_check_mode
+
+    - name: Describe check-mode behavior
+      ansible.builtin.debug:
+        msg: "Preflight passed. Check mode does not create resources or execute recipe-backed backup/restore."
+      when: ansible_check_mode

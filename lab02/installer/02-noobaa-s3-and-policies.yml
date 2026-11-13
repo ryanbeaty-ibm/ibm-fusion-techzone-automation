@@ -1,0 +1,367 @@
+---
+- name: Lab 02 v0.2 | Configure NooBaa S3 location and backup policies
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    lab02_kubeconfig: "{{ lookup('env', 'HOME') }}/.kube/lab02.conf"
+    fusion_namespace: ibm-spectrum-fusion-ns
+    backup_namespace: ibm-backup-restore
+    obc_name: fusion-backup-target
+    obc_storage_class: openshift-storage.noobaa.io
+    fusion_location_name: hubspoke-bucket
+    fusion_credentials_name: fusion-lab02-noobaa-credentials
+    fusion_certificate_name: fusion-lab02-noobaa-certificate
+    fusion_provider: isf-backup-restore
+    poll_seconds: 15
+    hub_max_wait_seconds: 1800
+    obc_max_wait_seconds: 300
+    location_max_wait_seconds: 300
+    policy_timezone: America/Los_Angeles
+  environment:
+    KUBECONFIG: "{{ lab02_kubeconfig }}"
+  tasks:
+    - name: Confirm the OpenShift API server
+      ansible.builtin.command: oc whoami --show-server
+      register: cluster_api
+      changed_when: false
+      check_mode: false
+
+    - name: Refuse to run on any cluster other than Lab 02
+      ansible.builtin.assert:
+        that:
+          - "expected_hub_api_fragment in cluster_api.stdout"
+        fail_msg: 'Wrong hub cluster; expected API fragment {{ expected_hub_api_fragment }}. No changes made.'
+
+    - name: Verify required OBC StorageClass exists
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - storageclass
+          - "{{ obc_storage_class }}"
+          - -o
+          - json
+      register: noobaa_sc
+      changed_when: false
+      check_mode: false
+
+    - name: Verify NooBaa provisioner
+      ansible.builtin.assert:
+        that:
+          - "(noobaa_sc.stdout | from_json).provisioner == 'openshift-storage.noobaa.io/obc'"
+
+    - name: Detect Backup and Restore hub install status
+      ansible.builtin.command: >-
+        oc get fusionserviceinstance ibm-backup-restore-service-instance
+        -n {{ fusion_namespace }}
+        -o jsonpath={.status.installStatus.status}
+      register: hub_state
+      changed_when: false
+      check_mode: false
+      until: (hub_state.stdout | trim) in ['Completed', 'Failed', 'Error']
+      retries: "{{ (hub_max_wait_seconds // poll_seconds) | int }}"
+      delay: "{{ poll_seconds }}"
+
+    - name: Require fully installed hub
+      ansible.builtin.assert:
+        that:
+          - "(hub_state.stdout | trim) == 'Completed'"
+        fail_msg: "Backup hub status: {{ hub_state.stdout | trim }}. Cannot configure storage."
+
+    - name: Check hub deployment readiness
+      ansible.builtin.command: oc get deployments -n {{ backup_namespace }} -o json
+      register: deployment_snapshot
+      changed_when: false
+      check_mode: false
+
+    - name: Verify that hub deployments are available
+      ansible.builtin.assert:
+        that:
+          - "(item.status.availableReplicas | default(0) | int) >= (item.spec.replicas | default(1) | int)"
+        fail_msg: "{{ item.metadata.name }} is not fully available; rerun after service settles."
+      loop: "{{ (deployment_snapshot.stdout | from_json)['items'] }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: Discover NooBaa S3 route hostname
+      ansible.builtin.command: >-
+        oc get route s3 -n openshift-storage -o jsonpath={.spec.host}
+      register: s3_route
+      changed_when: false
+      check_mode: false
+
+    - name: Require Lab 02 HTTPS S3 route
+      ansible.builtin.assert:
+        that:
+          - "(s3_route.stdout | trim).startswith(expected_hub_s3_route_prefix)"
+
+    - name: Inspect existing ObjectBucketClaim
+      ansible.builtin.command: >-
+        oc get objectbucketclaim {{ obc_name }} -n {{ fusion_namespace }}
+        -o json --ignore-not-found
+      register: existing_obc
+      changed_when: false
+      check_mode: false
+
+    - name: Reject OBC with unexpected storage class
+      ansible.builtin.assert:
+        that:
+          - "(existing_obc.stdout | from_json).spec.storageClassName == obc_storage_class"
+        fail_msg: "Existing OBC {{ obc_name }} uses a different storage class."
+      when: existing_obc.stdout | trim != ''
+
+    - name: Create ObjectBucketClaim if absent
+      ansible.builtin.command:
+        argv: [oc, create, -f, '-']
+        stdin: |
+          apiVersion: objectbucket.io/v1alpha1
+          kind: ObjectBucketClaim
+          metadata:
+            name: {{ obc_name }}
+            namespace: {{ fusion_namespace }}
+            labels:
+              app.kubernetes.io/managed-by: lab02-ansible
+              app.kubernetes.io/part-of: fusion-lab02
+          spec:
+            generateBucketName: {{ obc_name }}
+            storageClassName: {{ obc_storage_class }}
+      when:
+        - existing_obc.stdout | trim == ''
+        - not ansible_check_mode
+
+    - name: Wait for the bucket claim to bind
+      ansible.builtin.command: >-
+        oc get objectbucketclaim {{ obc_name }} -n {{ fusion_namespace }}
+        -o jsonpath={.status.phase}
+      register: obc_state
+      changed_when: false
+      until: (obc_state.stdout | trim) in ['Bound', 'Failed', 'Error']
+      retries: "{{ (obc_max_wait_seconds // poll_seconds) | int }}"
+      delay: "{{ poll_seconds }}"
+      when: not ansible_check_mode
+
+    - name: Verify bucket claim bound
+      ansible.builtin.assert:
+        that:
+          - "(obc_state.stdout | trim) == 'Bound'"
+        fail_msg: "OBC status: {{ obc_state.stdout | trim }}."
+      when: not ansible_check_mode
+
+    - name: Read generated bucket metadata
+      ansible.builtin.command: >-
+        oc get configmap {{ obc_name }} -n {{ fusion_namespace }} -o json
+      register: bucket_config
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Read generated NooBaa access keys without displaying them
+      ansible.builtin.command: >-
+        oc get secret {{ obc_name }} -n {{ fusion_namespace }} -o json
+      register: bucket_credentials
+      changed_when: false
+      no_log: true
+      when: not ansible_check_mode
+
+    - name: Confirm generated bucket metadata and credentials exist
+      ansible.builtin.assert:
+        that:
+          - "(bucket_config.stdout | from_json).data.BUCKET_NAME | length > 0"
+          - "(bucket_credentials.stdout | from_json).data.AWS_ACCESS_KEY_ID | length > 0"
+          - "(bucket_credentials.stdout | from_json).data.AWS_SECRET_ACCESS_KEY | length > 0"
+        fail_msg: 'NooBaa did not generate the expected bucket metadata or credentials.'
+      no_log: true
+      when: not ansible_check_mode
+
+    - name: Retrieve HTTPS certificate from S3 route
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        openssl s_client
+        -connect {{ s3_route.stdout | trim }}:443
+        -servername {{ s3_route.stdout | trim }}
+        -showcerts < /dev/null 2>/dev/null |
+        openssl x509 -outform PEM
+      args:
+        executable: /bin/bash
+      register: route_certificate
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Verify a PEM certificate was retrieved
+      ansible.builtin.assert:
+        that:
+          - "'-----BEGIN CERTIFICATE-----' in route_certificate.stdout"
+          - "'-----END CERTIFICATE-----' in route_certificate.stdout"
+      when: not ansible_check_mode
+
+    - name: Install or update Fusion NooBaa credentials Secret
+      ansible.builtin.command:
+        argv: [oc, apply, -f, '-']
+        stdin: |
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: {{ fusion_credentials_name }}
+            namespace: {{ fusion_namespace }}
+            labels:
+              app.kubernetes.io/managed-by: lab02-ansible
+              app.kubernetes.io/part-of: fusion-lab02
+              dp.isf.ibm.com/provider-name: {{ fusion_provider }}
+              dp.isf.ibm.com/ownedBy: fbsl
+          type: Opaque
+          data:
+            access-key-id: {{ (bucket_credentials.stdout | from_json).data.AWS_ACCESS_KEY_ID }}
+            secret-access-key: {{ (bucket_credentials.stdout | from_json).data.AWS_SECRET_ACCESS_KEY }}
+      no_log: true
+      when: not ansible_check_mode
+
+    - name: Install or update S3 certificate Secret
+      ansible.builtin.command:
+        argv: [oc, apply, -f, '-']
+        stdin: |
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: {{ fusion_certificate_name }}
+            namespace: {{ fusion_namespace }}
+            labels:
+              app.kubernetes.io/managed-by: lab02-ansible
+              app.kubernetes.io/part-of: fusion-lab02
+          type: Opaque
+          data:
+            tls.crt: {{ ((route_certificate.stdout | trim) ~ ('%c' | format(10))) | b64encode }}
+      when: not ansible_check_mode
+
+    - name: Inspect existing Fusion backup location
+      ansible.builtin.command: >-
+        oc get backupstoragelocation.data-protection.isf.ibm.com
+        {{ fusion_location_name }} -n {{ fusion_namespace }}
+        -o json --ignore-not-found
+      register: existing_location
+      changed_when: false
+      check_mode: false
+
+    - name: Protect existing unmanaged or incompatible backup location
+      ansible.builtin.assert:
+        that:
+          - "(existing_location.stdout | from_json).metadata.labels['app.kubernetes.io/managed-by'] | default('') == 'lab02-ansible'"
+          - "(existing_location.stdout | from_json).spec.type == 'noobaa'"
+        fail_msg: 'A different backup location already owns this name. No changes made.'
+      when: existing_location.stdout | trim != ''
+
+    - name: Create or reconcile Fusion NooBaa BackupStorageLocation
+      ansible.builtin.command:
+        argv: [oc, apply, -f, '-']
+        stdin: |
+          apiVersion: data-protection.isf.ibm.com/v1alpha1
+          kind: BackupStorageLocation
+          metadata:
+            name: {{ fusion_location_name }}
+            namespace: {{ fusion_namespace }}
+            labels:
+              app.kubernetes.io/managed-by: lab02-ansible
+              app.kubernetes.io/part-of: fusion-lab02
+              dp.isf.ibm.com/provider-name: {{ fusion_provider }}
+          spec:
+            type: noobaa
+            provider: {{ fusion_provider }}
+            credentialName: {{ fusion_credentials_name }}
+            privateCertificateName: {{ fusion_certificate_name }}
+            params:
+              bucket: {{ (bucket_config.stdout | from_json).data.BUCKET_NAME }}
+              endpoint: https://{{ s3_route.stdout | trim }}
+      when: not ansible_check_mode
+
+    - name: Wait for Fusion S3 backup location connection
+      ansible.builtin.command: >-
+        oc get backupstoragelocation.data-protection.isf.ibm.com
+        {{ fusion_location_name }} -n {{ fusion_namespace }}
+        -o jsonpath={.status.phase}
+      register: location_state
+      changed_when: false
+      until: (location_state.stdout | trim) in ['Connected', 'Failed', 'Error']
+      retries: "{{ (location_max_wait_seconds // poll_seconds) | int }}"
+      delay: "{{ poll_seconds }}"
+      when: not ansible_check_mode
+
+    - name: Require Fusion S3 location to be connected
+      ansible.builtin.assert:
+        that:
+          - "(location_state.stdout | trim) == 'Connected'"
+        fail_msg: >-
+          Backup location status: {{ location_state.stdout | trim }}.
+          Inspect with oc describe fbsl {{ fusion_location_name }} -n {{ fusion_namespace }}.
+      when: not ansible_check_mode
+
+    - name: Inspect existing backup policies
+      ansible.builtin.command: >-
+        oc get backuppolicies.data-protection.isf.ibm.com -n {{ fusion_namespace }} -o json
+      register: existing_policies
+      changed_when: false
+      check_mode: false
+
+    - name: Refuse conflicting unmanaged policy names
+      ansible.builtin.assert:
+        that:
+          - "(item.metadata.labels | default({})).get('app.kubernetes.io/managed-by', '') == 'lab02-ansible'"
+        fail_msg: "Existing {{ item.metadata.name }} policy is not managed by Lab 02."
+      loop: "{{ (existing_policies.stdout | from_json)['items'] | selectattr('metadata.name', 'in', ['daily-snapshot', 'weekly-backup']) | list }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: Create or reconcile the daily in-place snapshot policy
+      ansible.builtin.command:
+        argv: [oc, apply, -f, '-']
+        stdin: |
+          apiVersion: data-protection.isf.ibm.com/v1alpha1
+          kind: BackupPolicy
+          metadata:
+            name: daily-snapshot
+            namespace: {{ fusion_namespace }}
+            labels:
+              app.kubernetes.io/managed-by: lab02-ansible
+              app.kubernetes.io/part-of: fusion-lab02
+          spec:
+            provider: {{ fusion_provider }}
+            backupStorageLocation: isf-dp-inplace-snapshot
+            retention:
+              number: 30
+              unit: days
+            schedule:
+              cron: '0 2 * * *'
+              timezone: {{ policy_timezone }}
+      when: not ansible_check_mode
+
+    - name: Create or reconcile the weekly NooBaa object backup policy
+      ansible.builtin.command:
+        argv: [oc, apply, -f, '-']
+        stdin: |
+          apiVersion: data-protection.isf.ibm.com/v1alpha1
+          kind: BackupPolicy
+          metadata:
+            name: weekly-backup
+            namespace: {{ fusion_namespace }}
+            labels:
+              app.kubernetes.io/managed-by: lab02-ansible
+              app.kubernetes.io/part-of: fusion-lab02
+          spec:
+            provider: {{ fusion_provider }}
+            backupStorageLocation: {{ fusion_location_name }}
+            retention:
+              number: 30
+              unit: days
+            schedule:
+              cron: '0 3 * * 0'
+              timezone: {{ policy_timezone }}
+      when: not ansible_check_mode
+
+    - name: Show final non-sensitive storage and policy status
+      ansible.builtin.command: >-
+        oc get fbsl,backuppolicy -n {{ fusion_namespace }}
+      register: backup_summary
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Summarize stage result
+      ansible.builtin.debug:
+        msg: "{{ backup_summary.stdout | default('Check mode: preflight only; no changes made.') }}"
