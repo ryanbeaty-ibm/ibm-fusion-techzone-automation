@@ -1,0 +1,144 @@
+---
+- name: Lab 02 Stage 05a | Automate Service Protection storage prerequisites
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    hub_kubeconfig: "{{ lookup('env', 'HOME') }}/.kube/lab02.conf"
+    spoke_kubeconfig: "{{ lookup('env', 'HOME') }}/.kube/lab01.conf"
+    hub_api_fragment: api.itz-t63twk.infra01-lb.wdc07.techzone.ibm.com
+    spoke_api_fragment: api.itz-2xvmb0.infra01-lb.wdc04.techzone.ibm.com
+    service_protection_obc_namespace: fusion-lab02-protection
+    service_protection_obc_name: lab02-service-protection
+    service_protection_cert_secret: lab02-service-protection-cert
+    service_protection_s3_route: s3-openshift-storage.apps.itz-2xvmb0.infra01-lb.wdc04.techzone.ibm.com
+  tasks:
+    - name: Confirm hub kubeconfig identity
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ hub_kubeconfig }}", whoami, --show-server]
+      register: hub_api
+      changed_when: false
+      check_mode: false
+    - name: Confirm spoke kubeconfig identity
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ spoke_kubeconfig }}", whoami, --show-server]
+      register: spoke_api
+      changed_when: false
+      check_mode: false
+    - name: Refuse mistaken hub and spoke targets
+      ansible.builtin.assert:
+        that:
+          - hub_api_fragment in hub_api.stdout
+          - spoke_api_fragment in spoke_api.stdout
+          - hub_api.stdout != spoke_api.stdout
+    - name: Confirm spoke's S3 route matches the declared endpoint
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ spoke_kubeconfig }}", -n, openshift-storage, get, route, s3, -o, 'jsonpath={.spec.host}']
+      register: spoke_s3_route
+      changed_when: false
+      check_mode: false
+    - name: Refuse mismatched S3 endpoint
+      ansible.builtin.assert:
+        that:
+          - (spoke_s3_route.stdout | trim) == service_protection_s3_route
+    - name: Create or retain dedicated Service Protection namespace on spoke
+      ansible.builtin.shell: |
+        set -euo pipefail
+        oc --kubeconfig="{{ spoke_kubeconfig }}" create namespace "{{ service_protection_obc_namespace }}" \
+          --dry-run=client -o yaml | oc --kubeconfig="{{ spoke_kubeconfig }}" apply -f -
+      args:
+        executable: /bin/bash
+      register: namespace_apply
+      changed_when: "'created' in namespace_apply.stdout or 'configured' in namespace_apply.stdout"
+      when: not ansible_check_mode
+    - name: Create or retain dedicated NooBaa Object Bucket Claim on spoke
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ spoke_kubeconfig }}", apply, -f, '-']
+        stdin: |
+          apiVersion: objectbucket.io/v1alpha1
+          kind: ObjectBucketClaim
+          metadata:
+            name: {{ service_protection_obc_name }}
+            namespace: {{ service_protection_obc_namespace }}
+            labels:
+              app.kubernetes.io/managed-by: lab02-ansible
+              app.kubernetes.io/part-of: fusion-lab02
+          spec:
+            generateBucketName: {{ service_protection_obc_name }}
+            storageClassName: openshift-storage.noobaa.io
+      register: obc_apply
+      changed_when: "'created' in obc_apply.stdout or 'configured' in obc_apply.stdout"
+      when: not ansible_check_mode
+    - name: Wait for dedicated bucket to be Bound
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ spoke_kubeconfig }}", -n, "{{ service_protection_obc_namespace }}", wait, '--for=jsonpath={.status.phase}=Bound', 'obc/{{ service_protection_obc_name }}', '--timeout=240s']
+      register: obc_wait
+      changed_when: false
+      when: not ansible_check_mode
+    - name: Confirm endpoint certificate can be retrieved securely
+      ansible.builtin.command:
+        argv: [openssl, s_client, '-connect', '{{ service_protection_s3_route }}:443', '-servername', '{{ service_protection_s3_route }}', '-showcerts']
+        stdin: ''
+      register: tls_chain
+      changed_when: false
+      check_mode: false
+      failed_when: tls_chain.rc != 0 and 'BEGIN CERTIFICATE' not in tls_chain.stdout
+      no_log: true
+    - name: Require a valid certificate PEM block
+      ansible.builtin.assert:
+        that:
+          - "'-----BEGIN CERTIFICATE-----' in tls_chain.stdout"
+          - "'-----END CERTIFICATE-----' in tls_chain.stdout"
+    - name: Create temporary directory for public route certificate
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: '-lab02-public-cert'
+      register: cert_workdir
+      when: not ansible_check_mode
+    - name: Publish public S3 TLS certificate Secret on hub
+      block:
+        - name: Convert server TLS chain to a single leaf certificate
+          ansible.builtin.shell: |
+            set -euo pipefail
+            openssl s_client -connect '{{ service_protection_s3_route }}:443' \
+              -servername '{{ service_protection_s3_route }}' -showcerts </dev/null 2>/dev/null \
+              | openssl x509 -outform PEM > '{{ cert_workdir.path }}/tls.crt'
+            openssl x509 -in '{{ cert_workdir.path }}/tls.crt' -noout >/dev/null
+          args:
+            executable: /bin/bash
+          changed_when: false
+        - name: Create or retain hub certificate Secret using public TLS PEM
+          ansible.builtin.shell: |
+            set -euo pipefail
+            oc --kubeconfig='{{ hub_kubeconfig }}' -n ibm-spectrum-fusion-ns \
+              create secret generic '{{ service_protection_cert_secret }}' \
+              --type=Opaque --from-file=tls.crt='{{ cert_workdir.path }}/tls.crt' \
+              --dry-run=client -o yaml | \
+            oc --kubeconfig='{{ hub_kubeconfig }}' -n ibm-spectrum-fusion-ns apply -f -
+          args:
+            executable: /bin/bash
+          register: certificate_secret_apply
+          changed_when: "'created' in certificate_secret_apply.stdout or 'configured' in certificate_secret_apply.stdout"
+          no_log: true
+      always:
+        - name: Remove temporary public certificate file
+          ansible.builtin.file:
+            path: "{{ cert_workdir.path }}"
+            state: absent
+          changed_when: false
+      when: not ansible_check_mode
+    - name: Retrieve generated bucket name (not a credential)
+      ansible.builtin.command:
+        argv: [oc, "--kubeconfig={{ spoke_kubeconfig }}", -n, "{{ service_protection_obc_namespace }}", get, configmap, "{{ service_protection_obc_name }}", -o, 'jsonpath={.data.BUCKET_NAME}']
+      register: bucket_name
+      changed_when: false
+      when: not ansible_check_mode
+    - name: Display non-secret inputs for manual Fusion UI configuration
+      ansible.builtin.debug:
+        msg:
+          - "S3 endpoint: https://{{ service_protection_s3_route }}"
+          - "Bucket: {{ bucket_name.stdout | trim }}"
+          - "Credential Secret: spoke namespace {{ service_protection_obc_namespace }}, Secret {{ service_protection_obc_name }} (do NOT print or commit credentials)"
+          - "Hub TLS certificate Secret: {{ service_protection_cert_secret }}"
+          - "Next: configure Service Protection storage and backup policy in Fusion hub GUI."
+      when: not ansible_check_mode

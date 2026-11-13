@@ -41,3 +41,14 @@ git -C $Repo ls-files --cached | Select-String 'BackupAndRestoreAgentDeployment|
 ```
 
 Do not commit generated secrets or actual kubeconfigs. Also inspect the Git diff for accidental keys in screenshots or pasted YAML. This package intentionally excludes screenshots and the vendor PDF. Repository owner decides on license/publication policy.
+
+
+## Updating an existing Lab 02 publication
+
+Download the latest consolidated ZIP and expand it into the **root of the existing local Git clone** so the archive’s `lab02/` folder overlays the already published `lab02/`. Review changes in GitHub Desktop, then commit and push. The root README stays untouched; update its roadmap link separately if needed.
+
+Windows PowerShell example (choose your actual ZIP filename):
+
+```powershell
+Expand-Archive -LiteralPath "D:\Dropbox\Fusion\level4_lab02\Fusion-Lab02-One-Command-Update.zip" -DestinationPath "D:\GitHub\ibm-fusion-techzone-automation" -Force
+```

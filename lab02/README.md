@@ -48,76 +48,48 @@ chmod 600 config/environment.yml
 
 A managed environment may use different StorageClass names or Fusion custom resource fields. If you change those, examine the bundled application manifests and each playbook before running; the example assumes Ceph RBD and NooBaa. The first v0.1–v0.4.4 versions use fixed demonstration names such as `filebrowser` and `pacman`; choose fresh, lab-owned namespaces and backup names if you are not starting from a clean reservation.
 
-## 3. Execution order — automated stages and manual checkpoints
+## 3. Run the complete Lab 02 with ONE command
+
+From Ubuntu, after configuring `config/environment.yml` (section 2), run:
+
+```bash
+bash scripts/run-lab02.sh
+```
+
+**That is the normal entry point.** It automatically executes stages **01–04** in sequence, automatically prepares the stage **05a** Service Protection bucket and certificate, **pauses for only two IBM Fusion UI tasks** (05b and 06a), automatically checks prerequisites (05c), deploys the spoke agent (06b) and performs cross-cluster restore plus SHA-256 validation (07). Type `CONTINUE` at each UI checkpoint **only after verifying the required status**. The 05c preflight checks the bucket/cert/network, **not** the Service Protection backup job itself; the latter is verified in the Fusion UI.
+
+To review the execution plan without doing anything:
+
+```bash
+bash scripts/run-lab02.sh --plan
+```
+
+If a stage fails, fix the cause and resume without rerunning earlier stages, for example `bash scripts/run-lab02.sh --from 05c` or `bash scripts/run-lab02.sh --from 07`. The wrapper stops immediately on errors; it never skips a failing stage automatically. The underlying playbooks are separate **implementation modules**, not separate commands a normal user must run.
+
+### Internal stages (run automatically unless marked manual)
 
 | Stage | Action | How to run | Evidence / outcome |
 |---|---|---|---|
-| **01** | Install IBM Fusion Backup & Restore hub | `./scripts/run-stage.sh 01 run` | Fusion service instance `Completed` |
-| **02** | Create hub NooBaa OBC, S3 location, snapshot and weekly backup policies | `./scripts/run-stage.sh 02 run` | `hubspoke-bucket` `Connected` |
-| **03** | Deploy FileBrowser; backup and restore into `filebrowser2`; verify 8 MiB SHA-256 | `./scripts/run-stage.sh 03 run` | Backup/Restore `Completed`, matching hashes |
-| **04** | MongoDB/Pac-Man application-consistent backup, `pacman4` recovery, automatic UID repair | `./scripts/run-stage.sh 04 run` | `fsyncLock`/`fsyncUnlock` and MongoDB document hash passed |
-| **05a** | Prepare second-cluster Service Protection bucket and hub certificate | Follow [manual checkpoints](docs/manual-checkpoints.md) | Dedicated OBC `Bound`, reachable S3, certificate Secret created |
-| **05b** | **GUI** — configure Service Protection storage and daily schedule; initiate backup | IBM Fusion Hub **Backup & restore → Service protection** | Storage location `Connected`; first service backup `Completed` |
-| **05c** | Read-only preflight of Service Protection storage prerequisites | See below | OBC and certificate exist; S3 endpoint responds |
-| **06a** | **GUI** — generate one-hour spoke installation YAML from Hub Topology | IBM Fusion Hub **Topology → Connect clusters → Automate deployment** | Local `BackupAndRestoreAgentDeployment.yaml`, **never commit** |
-| **06b** | Bootstrap spoke on second cluster using hub-generated YAML | See below, or validated `oc --kubeconfig=... apply -f` | Agent instance `Completed`, Topology `Connected/Healthy` |
-| **07** | Restore FileBrowser to the spoke, verify source/spoke SHA-256, reuse on rerun | `./scripts/run-stage.sh 07 run` | Cross-cluster integrity passed; `changed=0` on validated adoption run |
+| **01** | Install IBM Fusion Backup & Restore hub | **Automatic** | Fusion service instance `Completed` |
+| **02** | Create hub NooBaa OBC, S3 location, snapshot and weekly backup policies | **Automatic** | `hubspoke-bucket` `Connected` |
+| **03** | Deploy FileBrowser; backup and restore into `filebrowser2`; verify 8 MiB SHA-256 | **Automatic** | Backup/Restore `Completed`, matching hashes |
+| **04** | MongoDB/Pac-Man application-consistent backup, `pacman4` recovery, automatic UID repair | **Automatic** | `fsyncLock`/`fsyncUnlock` and MongoDB document hash passed |
+| **05a** | **AUTO** — prepare second-cluster Service Protection bucket and hub certificate | Run by `run-lab02.sh` | Dedicated OBC `Bound`; certificate Secret created |
+| **05b** | **MANUAL GUI** — configure Service Protection storage and daily schedule; initiate backup | IBM Fusion Hub **Backup & restore → Service protection** | Storage location `Connected`; first service backup `Completed` |
+| **05c** | **AUTO** — read-only preflight of Service Protection storage prerequisites | Run by `run-lab02.sh` | OBC and certificate exist; S3 endpoint responds |
+| **06a** | **MANUAL GUI** — generate one-hour spoke installation YAML from Hub Topology | IBM Fusion Hub **Topology → Connect clusters → Automate deployment** | Local `BackupAndRestoreAgentDeployment.yaml`, **never commit** |
+| **06b** | **AUTO** — bootstrap spoke from hub-generated YAML | Run by `run-lab02.sh` | Agent instance `Completed`, Topology `Connected/Healthy` |
+| **07** | Restore FileBrowser to the spoke, verify source/spoke SHA-256, reuse on rerun | **Automatic** | Cross-cluster integrity passed; `changed=0` on validated adoption run |
 
-**Important:** stages 01–04 and 07 use existing validated playbook bodies, with small consolidation changes (overridable cluster guards and final fixes). Stage 05c and Ansible wrapper stage 06b are *new helpers, statically checked but not live-tested*. The **manual** OBC/certificate setup and hub-generated YAML deployment commands **were live validated**. Stage 02 was functionally validated; some `oc apply` operations can still report changes on a rerun. Stage 07's Ansible adoption/read-only verification succeeded, but its fresh-restore creation branch was not separately live-tested (the first restore was initiated using `oc`). See [validation evidence](evidence/validated-runs.md).
+**Important:** stages 01–04 and 07 use existing validated playbook bodies, with small consolidation changes (overridable cluster guards and final fixes). Stage 05a/05c and the Ansible wrapper stage 06b are *new helpers, statically checked but not live-tested*. The **manual** OBC/certificate setup and hub-generated YAML deployment commands **were live validated**. Stage 02 was functionally validated; some `oc apply` operations can still report changes on a rerun. Stage 07's Ansible adoption/read-only verification succeeded, but its fresh-restore creation branch was not separately live-tested (the first restore was initiated using `oc`). See [validation evidence](evidence/validated-runs.md).
 
-### Commands for Ansible stages
+### Manual checkpoints — only two
 
-Use the stage runner to keep config and playbook consistent:
+**05b — Service Protection:** Hub IBM Fusion GUI → **Backup & restore → Service protection**. Configure the pre-created S3 bucket/certificate, daily schedule, and initiate a backup. Confirm the first backup is **Completed** before typing `CONTINUE` in Ubuntu.
 
-```bash
-./scripts/run-stage.sh 01 syntax
-./scripts/run-stage.sh 01 check
-./scripts/run-stage.sh 01 run
+**06a — Connect spoke:** Hub IBM Fusion GUI → **Backup & restore → Topology → Connect cluster → Automate deployment**. Generate/download `BackupAndRestoreAgentDeployment.yaml`, transfer it securely into your Ubuntu home folder and set `chmod 600`. Then type `CONTINUE`; Ansible will apply it to the spoke and validate readiness. If already connected and healthy, this step does not require another YAML.
 
-./scripts/run-stage.sh 02 check
-./scripts/run-stage.sh 02 run
-./scripts/run-stage.sh 03 run
-./scripts/run-stage.sh 04 run
-```
-
-Wait for each stage to complete and inspect its results before starting the next. `--check` runs preflight on the application playbooks and **intentionally skips backup/restore and hash proof**. Execute normally to prove data integrity. Most polling intervals are 15 seconds; 30-minute waits are upper bounds, not delays.
-
-### Service Protection manual interlude (05)
-
-Follow [docs/manual-checkpoints.md](docs/manual-checkpoints.md) for a dedicated OBC on the second cluster, TLS certificate handling, exact Fusion UI fields and schedule. Then run this *read-only* prerequisite verifier:
-
-```bash
-ansible-playbook -i localhost, -c local installer/05-service-protection-preflight.yml \
-  -e @config/environment.yml
-```
-
-This confirms storage inputs, **not** that IBM Fusion created a successful service backup. Verify status and available backup count in the Fusion UI; do not claim end-to-end automation of this UI-only feature.
-
-### Spoke bootstrap manual interlude (06)
-
-From the **hub UI**, download the IBM-generated `BackupAndRestoreAgentDeployment.yaml`, copy it onto Ubuntu, and set `chmod 600`. Deploy only to the spoke. We originally validated the explicit `oc --kubeconfig="$HOME/.kube/lab01.conf" apply -f ...` command. An optional Ansible wrapper for future runs:
-
-```bash
-ansible-playbook -i localhost, -c local installer/06-spoke-agent-bootstrap.yml \
-  -e @config/environment.yml \
-  -e "generated_spoke_manifest=$HOME/BackupAndRestoreAgentDeployment.yaml"
-```
-
-**Do not use the generated YAML after its token expires (~1 hour).** Never commit or paste the generated file. Confirm the **hub UI Topology** displays the second cluster `Connected / Healthy`.
-
-### Cross-cluster application restore (07)
-
-After the hub has a successful FileBrowser S3 backup, the spoke agent is connected, the spoke can reach the hub S3 route, and its destination `filebrowser` namespace is free (or owned by the matching restore):
-
-```bash
-./scripts/run-stage.sh 07 syntax
-./scripts/run-stage.sh 07 check
-./scripts/run-stage.sh 07 run
-# Repeat the exact same command to confirm idempotency.
-./scripts/run-stage.sh 07 run
-```
-
-The Restore custom resource is created **on the hub** using the registered spoke's `targetCluster`. The playbook refuses to overwrite a namespace on the spoke if the matching managed restore is absent, and refuses conflicting Restore objects. It then verifies the source and recovered SHA-256 hashes. See [validation evidence](evidence/validated-runs.md).
+See [step-by-step UI checkpoints](docs/manual-checkpoints.md). These are the only two normal pauses. The detailed playbook commands are reserved for [advanced stage troubleshooting](docs/advanced-operations.md).
 
 ## 4. Repository contents
 
@@ -134,15 +106,18 @@ lab02/
     04-mongodb-consistent-backup-restore.yml
     mongodb-recipe-v0.4.yaml
     pacman-all-v0.4.yaml
+    05-service-protection-prepare.yml
     05-service-protection-preflight.yml
     06-spoke-agent-bootstrap.yml
     07-crosscluster-filebrowser-restore.yml
+  docs/advanced-operations.md
   docs/prerequisites.md
   docs/manual-checkpoints.md
   docs/security.md
   docs/troubleshooting.md
   evidence/validated-runs.md
-  scripts/run-stage.sh
+  scripts/run-lab02.sh              # THE ONLY COMMAND FOR NORMAL EXECUTION
+  scripts/run-stage.sh               # advanced per-stage troubleshooting
 ```
 
 ## 5. Safety and limitations
@@ -157,8 +132,6 @@ lab02/
 
 ## 6. GitHub installation
 
-This package is designed to be extracted **as `lab02/` inside your existing Git repository**, alongside `lab01/` if present. Do not overwrite your validated Lab 01 files. See [GitHub publication steps](docs/publish-to-github.md). The owner should choose licensing before making the repository public.
-
-On the validated Windows workstation, the existing Git clone is `D:\GitHub\ibm-fusion-techzone-automation`. Use the supplied standalone `Apply-IBM-Fusion-Lab02-GitHub.ps1` (downloaded alongside this ZIP) to stage changes outside Git and copy only `lab02/`, then use GitHub Desktop to review, commit and Push origin.
+The ZIP contains only `lab02/` and can be extracted over the same folder in the existing local Git repository without modifying Lab 01 or the root README. On Windows, use `Expand-Archive -Force` to overlay the files; see [GitHub publication steps](docs/publish-to-github.md). Review the diff in GitHub Desktop before committing and pushing. The owner should choose licensing before making the repository public.
 
 For original IBM procedural context, use your authorized **IBM Fusion Level 4 Backup and Restore Lab Guide**, and check IBM documentation for your installed Fusion version. Our README documents the tested 2.14.1 implementation and known differences from the older guide.

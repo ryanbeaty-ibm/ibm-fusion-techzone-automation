@@ -29,3 +29,8 @@ caf85e4ede776f0a8ab82bae96ae0ec126f8ce8f3fb8ff6c0dcc8c585a2d608b
 - Stage 07's *fresh* Restore CR creation path was not exercised from Ansible; a matching Restore was created via `oc` and then adopted and verified by Ansible.
 - No destructive full restore of the Backup & Restore Service Protection control plane was performed.
 - A single test payload checksum proves data integrity for that payload, not general workload/application consistency under every condition.
+
+
+## Consolidated guided runner (added Nov 13, 2026)
+
+The single-command `scripts/run-lab02.sh` and new stage 05a Service Protection preparation playbook were created after the live v0.7 test. They passed static validation and are **not yet full-run live validated**. The underlying stages 01–04 were previously live tested individually, the Service Protection UI flow and OBC/certificate operations were done manually, and v0.7 existing-restore adoption was live tested with `changed=0 failed=0`. Do not conflate those results with a fresh run of the wrapper.
