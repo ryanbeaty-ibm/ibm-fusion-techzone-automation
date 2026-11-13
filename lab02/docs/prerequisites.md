@@ -1,5 +1,7 @@
 # Prepare two IBM TechZone environments and an Ubuntu automation VM
 
+> **First time doing this lab?** Follow the numbered [Lab 02 installation walkthrough](LAB02-BACKUP-AND-RESTORE.md) first. This page is an additional technical prerequisites reference.
+
 ## Reserve both clusters before beginning
 
 The complete IBM Fusion Level 4 Lab 02 requires **two independent OpenShift clusters, normally two separate TechZone reservations**, running concurrently. Earlier hub backup/restore work needs one cluster; **spoke onboarding and cross-cluster restore require both**. Reuse an existing second cluster only if it meets the version, storage, networking and permissions requirements. A participant does **not** have to perform Lab 01 to run Lab 02; our team happened to reuse the completed Lab 01 cluster as the Lab 02 spoke.

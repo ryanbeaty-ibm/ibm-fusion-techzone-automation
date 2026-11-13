@@ -1,5 +1,7 @@
 # Advanced Ansible stage operations (troubleshooting only)
 
+If this is your first run, follow the [numbered Lab 02 guide](LAB02-BACKUP-AND-RESTORE.md) instead of executing individual playbooks.
+
 The normal run is a **single command** from `lab02/`: `bash scripts/run-lab02.sh`. This page is for isolating a failing step, preserving evidence, or rerunning verification. **Don't execute every block below during a normal lab.**
 
 ### Advanced: manually run just one Ansible stage (troubleshooting only)

@@ -16,7 +16,24 @@ Use --from <stage> to resume after a stopped or previously completed stage.
 EOF
 }
 if [[ "${1:-}" == '--plan' ]]; then
-  usage
+  cat <<'EOF'
+IBM Fusion Level 4 | Lab 02 execution plan (no changes)
+
+ 01   AUTO    Install Backup & Restore hub
+ 02   AUTO    Configure NooBaa S3 and policies
+ 03   AUTO    Back up and recover FileBrowser; verify checksum
+ 04   AUTO    Back up and recover MongoDB with consistency recipe
+ 05a  AUTO    Prepare Service Protection S3 bucket and certificate
+ 05b  MANUAL  Configure Service Protection in HUB Fusion UI; confirm Completed
+ 05c  AUTO    Verify Service Protection bucket and certificate
+ 06a  MANUAL  Generate/download spoke agent YAML in HUB Fusion UI
+ 06b  AUTO    Install and verify spoke agent using SPOKE kubeconfig
+ 07   AUTO    Recover FileBrowser to spoke; compare SHA-256
+
+Prerequisites: two Fusion clusters, Ubuntu/Ansible/oc and config/environment.yml.
+Read: docs/LAB02-BACKUP-AND-RESTORE.md
+Run:  bash scripts/run-lab02.sh
+EOF
   exit 0
 fi
 if [[ "${1:-}" == '--from' && $# -eq 2 ]]; then
@@ -36,7 +53,7 @@ done
 run() {
   local stage="$1"
   printf '\n===== LAB 02 | AUTOMATED STAGE %s =====\n' "$stage"
-  bash bash "$ROOT/scripts/run-stage.sh" "$stage" run
+  bash "$ROOT/scripts/run-stage.sh" "$stage" run
 }
 checkpoint() {
   local stage="$1"

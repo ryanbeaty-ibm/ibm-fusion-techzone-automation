@@ -20,6 +20,11 @@ ARGS=( -i localhost, -c local "$ROOT/installer/$PLAY" -e "@$CONFIG" )
 case "$MODE" in
  syntax) exec ansible-playbook "${ARGS[@]}" --syntax-check ;;
  check) exec ansible-playbook "${ARGS[@]}" --check ;;
- run) exec env ANSIBLE_DISPLAY_OK_HOSTS=false ANSIBLE_DISPLAY_SKIPPED_HOSTS=false ansible-playbook "${ARGS[@]}" ;;
+ run)
+   # 05a must print its non-secret S3 endpoint and generated bucket name for the manual UI stage.
+   if [[ "$STAGE" == "05a" ]]; then
+     exec env ANSIBLE_DISPLAY_OK_HOSTS=true ANSIBLE_DISPLAY_SKIPPED_HOSTS=false ansible-playbook "${ARGS[@]}"
+   fi
+   exec env ANSIBLE_DISPLAY_OK_HOSTS=false ANSIBLE_DISPLAY_SKIPPED_HOSTS=false ansible-playbook "${ARGS[@]}" ;;
  *) echo 'Mode must be syntax, check, or run' >&2; exit 2 ;;
 esac

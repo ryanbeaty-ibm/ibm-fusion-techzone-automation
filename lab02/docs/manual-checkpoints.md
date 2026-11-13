@@ -1,5 +1,7 @@
 # Lab 02 GitHub documentation — manual checkpoints between Ansible stages
 
+> **Start here instead for first-time setup:** [Lab 02 step-by-step walkthrough](LAB02-BACKUP-AND-RESTORE.md). The two manual checkpoints below are part of the **one-command** guided run, not separate installation scripts.
+
 These instructions reflect the validated lab workflow through November 13, 2026. Screens and labels may vary with the installed IBM Fusion version. Never publish a generated deployment Secret, service credentials, kubeconfig, or access tokens.
 
 ## Before starting
