@@ -43,7 +43,7 @@ The template supplies three control-plane and three infrastructure nodes in addi
 | Lab | IBM Fusion Level 4 exercise | Automation |
 |---|---|---|
 | **1** | **[Installation and Configuration](docs/LAB01-INSTALLATION-AND-CONFIGURATION.md)** | **Available — Fusion, Ceph, and external Scale storage setup and verification** |
-| 2 | Backup and Restore | Planned |
+| **2** | **[Backup and Restore](lab02/README.md)** | **Available — S3, FileBrowser, MongoDB, Service Protection, and cross-cluster recovery** |
 | 3 | OpenShift Virtualization | Planned |
 | 4 | Control Tower | Planned |
 | 5 | Regional Disaster Recovery | Planned |
